@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -155,7 +156,22 @@ func TestMultiEnvForDirectoryWithMultipleRepos(t *testing.T) {
 		actual[env.name] = env.env.GetDoltDir()
 	}
 
-	assert.Equal(t, expected, actual)
+	panic(fmtStringMap(expected) + fmtStringMap(actual))
+	//assert.Equal(t, expected, actual)
+}
+
+func fmtStringMap(m map[string]string) string {
+	var sb strings.Builder
+	sb.WriteString("{\n")
+	for k, v := range m {
+		sb.WriteString("\t")
+		sb.WriteString(k)
+		sb.WriteString(": ")
+		sb.WriteString(v)
+		sb.WriteString(",\n")
+	}
+	sb.WriteString("}\n")
+	return sb.String()
 }
 
 func initMultiEnv(t *testing.T, testName string, names []string) (string, HomeDirProvider, map[string]*DoltEnv) {
