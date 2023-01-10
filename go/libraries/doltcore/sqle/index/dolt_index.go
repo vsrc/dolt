@@ -96,7 +96,64 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 		constrainedToLookupExpression: false,
 	}
 
-	return append(indexes, &toIndex), nil
+	indexes = append(indexes, &toIndex)
+	indexes = append(indexes, &doltIndex{
+		id:      "to_commit",
+		tblName: doltdb.DoltDiffTablePrefix + tbl,
+		dbName:  db,
+		columns: []schema.Column{
+			schema.NewColumn("to_commit", schema.DiffCommitTag, types.StringKind, false),
+		},
+		indexSch: sch,
+		tableSch: sch,
+		unique:   true,
+		comment:  "",
+		vrw:      t.ValueReadWriter(),
+		ns:       t.NodeStore(),
+		//keyBld:                        keyBld,
+		order:                         sql.IndexOrderAsc,
+		constrainedToLookupExpression: true,
+	})
+	indexes = append(indexes, &doltIndex{
+		id:      "from_commit",
+		tblName: doltdb.DoltDiffTablePrefix + tbl,
+		dbName:  db,
+		columns: []schema.Column{
+			schema.NewColumn("from_commit", schema.DiffCommitTag, types.StringKind, false),
+		},
+		indexSch: sch,
+		tableSch: sch,
+		unique:   true,
+		comment:  "",
+		vrw:      t.ValueReadWriter(),
+		ns:       t.NodeStore(),
+		//keyBld:                        keyBld,
+		order:                         sql.IndexOrderAsc,
+		constrainedToLookupExpression: true,
+	})
+	return indexes, nil
+}
+
+func DoltLogIndexes(ctx *sql.Context, dt sql.Table, db *doltdb.DoltDB) (indexes []sql.Index, err error) {
+	return []sql.Index{
+		&doltIndex{
+			id:      "commit_hash",
+			tblName: doltdb.LogTableName,
+			dbName:  "",
+			columns: []schema.Column{
+				schema.NewColumn("commit_hash", 0, types.StringKind, false),
+			},
+			indexSch: nil,
+			tableSch: nil,
+			unique:   true,
+			comment:  "",
+			vrw:      db.ValueReadWriter(),
+			ns:       db.NodeStore(),
+			//keyBld:                        keyBld,
+			order:                         sql.IndexOrderAsc,
+			constrainedToLookupExpression: true,
+		},
+	}, nil
 }
 
 func DoltIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Table) (indexes []sql.Index, err error) {

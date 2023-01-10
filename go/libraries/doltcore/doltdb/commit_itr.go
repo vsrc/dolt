@@ -133,7 +133,7 @@ func (cmItr *commitItr) Next(ctx context.Context) (hash.Hash, *Commit, error) {
 
 	next := cmItr.unprocessed[numUnprocessed-1]
 	cmItr.unprocessed = cmItr.unprocessed[:numUnprocessed-1]
-	cmItr.curr, err = hashToCommit(ctx, cmItr.ddb.ValueReadWriter(), cmItr.ddb.ns, next)
+	cmItr.curr, err = HashToCommit(ctx, cmItr.ddb.ValueReadWriter(), cmItr.ddb.ns, next)
 
 	if err != nil {
 		return hash.Hash{}, nil, err
@@ -142,7 +142,7 @@ func (cmItr *commitItr) Next(ctx context.Context) (hash.Hash, *Commit, error) {
 	return next, cmItr.curr, nil
 }
 
-func hashToCommit(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, h hash.Hash) (*Commit, error) {
+func HashToCommit(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, h hash.Hash) (*Commit, error) {
 	dc, err := datas.LoadCommitAddr(ctx, vrw, h)
 	if err != nil {
 		return nil, err
@@ -190,4 +190,57 @@ func (itr FilteringCommitItr) Next(ctx context.Context) (hash.Hash, *Commit, err
 // Reset the commit iterator back to the
 func (itr FilteringCommitItr) Reset(ctx context.Context) error {
 	return itr.itr.Reset(ctx)
+}
+
+func NewCommitIter(cm *Commit, m *datas.CommitMeta, h hash.Hash) (*CommitIter, error) {
+	return &CommitIter{cm: cm, m: m, h: h}, nil
+}
+
+type CommitIter struct {
+	h    hash.Hash
+	cm   *Commit
+	m    *datas.CommitMeta
+	done bool
+}
+
+var _ CommitItr = (*CommitIter)(nil)
+
+func (i *CommitIter) Next(ctx context.Context) (hash.Hash, *Commit, error) {
+	if i.done {
+		return hash.Hash{}, nil, io.EOF
+	}
+	i.done = true
+	return i.h, i.cm, nil
+
+}
+
+func (i *CommitIter) Reset(ctx context.Context) error {
+	i.done = false
+	return nil
+}
+
+func NewCommitSliceIter(cm []*Commit, h []hash.Hash) (*CommitSliceIter, error) {
+	return &CommitSliceIter{cm: cm, h: h}, nil
+}
+
+type CommitSliceIter struct {
+	h  []hash.Hash
+	cm []*Commit
+	i  int
+}
+
+var _ CommitItr = (*CommitSliceIter)(nil)
+
+func (i *CommitSliceIter) Next(ctx context.Context) (hash.Hash, *Commit, error) {
+	if i.i >= len(i.h) {
+		return hash.Hash{}, nil, io.EOF
+	}
+	i.i++
+	return i.h[i.i-1], i.cm[i.i-1], nil
+
+}
+
+func (i *CommitSliceIter) Reset(ctx context.Context) error {
+	i.i = 0
+	return nil
 }

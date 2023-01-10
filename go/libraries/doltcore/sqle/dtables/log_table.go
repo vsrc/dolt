@@ -15,7 +15,9 @@
 package dtables
 
 import (
+	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/go-mysql-server/sql"
+	"io"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions/commitwalk"
 	"github.com/dolthub/dolt/go/store/hash"
@@ -89,8 +91,50 @@ func (dt *LogTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 }
 
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition
-func (dt *LogTable) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
-	return NewLogItr(ctx, dt.ddb, dt.head)
+func (dt *LogTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
+	switch p := p.(type) {
+	case *commitPart:
+		return sql.RowsToRowIter(sql.NewRow(p.h.String(), p.m.Name, p.m.Email, p.m.Time(), p.m.Description)), nil
+	default:
+		return NewLogItr(ctx, dt.ddb, dt.head)
+	}
+}
+
+func (dt *LogTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return index.DoltLogIndexes(ctx, dt, dt.ddb)
+}
+
+// IndexedAccess implements sql.IndexAddressable
+func (dt *LogTable) IndexedAccess(index sql.Index) sql.IndexedTable {
+	nt := *dt
+	return &nt
+}
+
+func (dt *LogTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	qualCol := lookup.Index.Expressions()[0]
+	col := qualCol[len("dolt_log."):]
+
+	if col == "commit_hash" {
+		hs, _ := lookup.Ranges[0][0].LowerBound.(sql.Below).Key.(string)
+		h, ok := hash.MaybeParse(hs)
+		if !ok {
+			return sql.PartitionsToPartitionIter(), nil
+		}
+
+		cm, err := doltdb.HashToCommit(ctx, dt.ddb.ValueReadWriter(), dt.ddb.NodeStore(), h)
+		if err != nil {
+			return nil, err
+		}
+
+		meta, err := cm.GetCommitMeta(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return &CommitPartIter{m: meta, h: h}, nil
+	}
+
+	return dt.Partitions(ctx)
 }
 
 // LogItr is a sql.RowItr implementation which iterates over each commit as if it's a row in the table.
@@ -132,4 +176,37 @@ func (itr *LogItr) Next(ctx *sql.Context) (sql.Row, error) {
 // Close closes the iterator.
 func (itr *LogItr) Close(*sql.Context) error {
 	return nil
+}
+
+type CommitPartIter struct {
+	h    hash.Hash
+	m    *datas.CommitMeta
+	done bool
+}
+
+var _ sql.PartitionIter = (*CommitPartIter)(nil)
+
+func (i *CommitPartIter) Next(ctx *sql.Context) (sql.Partition, error) {
+	if i.done {
+		return nil, io.EOF
+	}
+	i.done = true
+	return &commitPart{h: i.h, m: i.m}, nil
+
+}
+
+func (i *CommitPartIter) Close(ctx *sql.Context) error {
+	return nil
+}
+
+type commitPart struct {
+	h hash.Hash
+	m *datas.CommitMeta
+}
+
+var _ sql.Partition = (*commitPart)(nil)
+
+func (c *commitPart) Key() []byte {
+	//TODO implement me
+	panic("implement me")
 }

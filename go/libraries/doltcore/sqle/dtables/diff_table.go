@@ -207,7 +207,90 @@ func (dt *DiffTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.Ro
 }
 
 func (dt *DiffTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	qualCol := lookup.Index.Expressions()[0]
+	col := qualCol[len("dolt_diff_"+dt.name+"."):]
+
+	if col == "to_commit" {
+		return dt.toCommitLookupPartitions(ctx, lookup)
+	}
+
 	return dt.Partitions(ctx)
+}
+
+func (dt *DiffTable) toCommitLookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	sf, err := SelectFuncForFilters(dt.ddb.Format(), dt.partitionFilters)
+	if err != nil {
+		return nil, err
+	}
+
+	cmHashToTblInfo := make(map[hash.Hash]TblInfoAtCommit)
+
+	hs, _ := lookup.Ranges[0][0].LowerBound.(sql.Below).Key.(string)
+	h, ok := hash.MaybeParse(hs)
+	if !ok {
+		return sql.PartitionsToPartitionIter(), nil
+	}
+
+	cm, err := doltdb.HashToCommit(ctx, dt.ddb.ValueReadWriter(), dt.ddb.NodeStore(), h)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := cm.GetRootValue(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tbl, exactName, ok, err := r.GetTableInsensitive(ctx, dt.name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return sql.PartitionsToPartitionIter(), nil
+	}
+
+	tblHash, _, err := r.GetTableHash(ctx, exactName)
+	if err != nil {
+		return nil, err
+	}
+
+	ph, err := cm.ParentHashes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	pm, err := cm.GetCommitMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ts := types.Timestamp(pm.Time())
+
+	toCmInfo := NewTblInfoAtCommit(h.String(), &ts, tbl, tblHash)
+
+	pCommits := make([]*doltdb.Commit, len(ph))
+	for i, pj := range ph {
+		pc, err := cm.GetParent(ctx, i)
+		if err != nil {
+			return nil, err
+		}
+		cmHashToTblInfo[pj] = toCmInfo
+		pCommits[i] = pc
+	}
+
+	cmItr, err := doltdb.NewCommitSliceIter(pCommits, ph)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DiffPartitions{
+		tblName:         exactName,
+		cmItr:           cmItr,
+		cmHashToTblInfo: cmHashToTblInfo,
+		selectFunc:      sf,
+		toSch:           dt.targetSch,
+		fromSch:         dt.targetSch,
+	}, nil
 }
 
 func (dt *DiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
@@ -249,6 +332,9 @@ func tableData(ctx *sql.Context, tbl *doltdb.Table, ddb *doltdb.DoltDB) (durable
 	}
 
 	return data, sch, nil
+}
+
+type DiffLookupBuilder struct {
 }
 
 type TblInfoAtCommit struct {
