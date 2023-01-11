@@ -15,6 +15,7 @@
 package dtables
 
 import (
+	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -67,6 +68,44 @@ func (dt *CommitAncestorsTable) Partitions(*sql.Context) (sql.PartitionIter, err
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition.
 func (dt *CommitAncestorsTable) PartitionRows(sqlCtx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
 	return NewCommitAncestorsRowItr(sqlCtx, dt.ddb)
+}
+
+// GetIndexes implements sql.IndexAddressable
+func (dt *CommitAncestorsTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return index.DoltCommitIndexes("commit_hash", dt.Name(), dt.ddb)
+}
+
+// IndexedAccess implements sql.IndexAddressable
+func (dt *CommitAncestorsTable) IndexedAccess(index sql.Index) sql.IndexedTable {
+	nt := *dt
+	return &nt
+}
+
+func (dt *CommitAncestorsTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	qualCol := lookup.Index.Expressions()[0]
+	col := qualCol[len(dt.Name()+"."):]
+
+	if col == "commit_hash" {
+		hs, _ := lookup.Ranges[0][0].LowerBound.(sql.Below).Key.(string)
+		h, ok := hash.MaybeParse(hs)
+		if !ok {
+			return sql.PartitionsToPartitionIter(), nil
+		}
+
+		cm, err := doltdb.HashToCommit(ctx, dt.ddb.ValueReadWriter(), dt.ddb.NodeStore(), h)
+		if err != nil {
+			return nil, err
+		}
+
+		meta, err := cm.GetCommitMeta(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return &CommitPartIter{m: meta, h: h}, nil
+	}
+
+	return dt.Partitions(ctx)
 }
 
 // CommitAncestorsRowItr is a sql.RowItr which iterates over each

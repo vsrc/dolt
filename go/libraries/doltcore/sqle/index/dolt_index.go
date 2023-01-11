@@ -112,7 +112,7 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 		ns:       t.NodeStore(),
 		//keyBld:                        keyBld,
 		order:                         sql.IndexOrderAsc,
-		constrainedToLookupExpression: true,
+		constrainedToLookupExpression: false,
 	})
 	indexes = append(indexes, &doltIndex{
 		id:      "from_commit",
@@ -129,7 +129,7 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 		ns:       t.NodeStore(),
 		//keyBld:                        keyBld,
 		order:                         sql.IndexOrderAsc,
-		constrainedToLookupExpression: true,
+		constrainedToLookupExpression: false,
 	})
 	return indexes, nil
 }
@@ -151,7 +151,29 @@ func DoltLogIndexes(ctx *sql.Context, dt sql.Table, db *doltdb.DoltDB) (indexes 
 			ns:       db.NodeStore(),
 			//keyBld:                        keyBld,
 			order:                         sql.IndexOrderAsc,
-			constrainedToLookupExpression: true,
+			constrainedToLookupExpression: false,
+		},
+	}, nil
+}
+
+func DoltCommitIndexes(col, tab string, db *doltdb.DoltDB) (indexes []sql.Index, err error) {
+	return []sql.Index{
+		&doltIndex{
+			id:      col,
+			tblName: tab,
+			dbName:  "",
+			columns: []schema.Column{
+				schema.NewColumn(col, 0, types.StringKind, false),
+			},
+			indexSch: nil,
+			tableSch: nil,
+			unique:   true,
+			comment:  "",
+			vrw:      db.ValueReadWriter(),
+			ns:       db.NodeStore(),
+			//keyBld:                        keyBld,
+			order:                         sql.IndexOrderAsc,
+			constrainedToLookupExpression: false,
 		},
 	}, nil
 }

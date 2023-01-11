@@ -101,7 +101,7 @@ func (dt *LogTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIte
 }
 
 func (dt *LogTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltLogIndexes(ctx, dt, dt.ddb)
+	return index.DoltCommitIndexes("commit_hash", dt.Name(), dt.ddb)
 }
 
 // IndexedAccess implements sql.IndexAddressable
