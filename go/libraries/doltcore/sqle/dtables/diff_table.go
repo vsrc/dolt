@@ -207,10 +207,7 @@ func (dt *DiffTable) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.Ro
 }
 
 func (dt *DiffTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
-	qualCol := lookup.Index.Expressions()[0]
-	col := qualCol[len("dolt_diff_"+dt.name+"."):]
-
-	if col == "to_commit" {
+	if lookup.Index.ID() == "to_commit" {
 		return dt.toCommitLookupPartitions(ctx, lookup)
 	}
 
@@ -278,7 +275,7 @@ func (dt *DiffTable) toCommitLookupPartitions(ctx *sql.Context, lookup sql.Index
 		pCommits[i] = pc
 	}
 
-	cmItr, err := doltdb.NewCommitSliceIter(pCommits, ph)
+	cmItr := doltdb.NewCommitSliceIter(pCommits, ph)
 	if err != nil {
 		return nil, err
 	}

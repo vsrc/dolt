@@ -16,6 +16,7 @@ package sqle
 
 import (
 	"context"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 	"io"
 	"strings"
 
@@ -26,7 +27,6 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/libraries/utils/set"
@@ -63,6 +63,7 @@ type HistoryTable struct {
 	doltTable     *DoltTable
 	commitFilters []sql.Expression
 	cmItr         doltdb.CommitItr
+	commitCheck   doltdb.CommitFilter
 	indexLookup   sql.IndexLookup
 	projectedCols []uint64
 }
@@ -75,7 +76,7 @@ func (ht *HistoryTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
 
 	// For index pushdown to work, we need to represent the indexes from the underlying table as belonging to this one
 	// Our results will also not be ordered, so we need to declare them as such
-	return index.DoltHistoryIndexesFromTable(ctx, ht.doltTable.db.Name(), ht.Name(), tbl)
+	return index.DoltHistoryIndexesFromTable(ctx, ht.doltTable.db.Name(), ht.Name(), tbl, ht.doltTable.db.DbData().Ddb)
 }
 
 func (ht *HistoryTable) IndexedAccess(i sql.Index) sql.IndexedTable {
@@ -83,6 +84,28 @@ func (ht *HistoryTable) IndexedAccess(i sql.Index) sql.IndexedTable {
 }
 
 func (ht *HistoryTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	if lookup.Index.ID() == index.CommitHashIndexId {
+		hs, ok := index.LookupToCommitPointSelect(lookup)
+		if !ok {
+			ht.indexLookup = lookup
+			return ht.Partitions(ctx)
+		}
+		h, ok := hash.MaybeParse(hs)
+		if !ok {
+			return sql.PartitionsToPartitionIter(), nil
+		}
+
+		iter, err := doltdb.CommitIterForHash(ctx, h, ht.doltTable.db.DbData().Ddb)
+		if err != nil {
+			return nil, err
+		}
+
+		if ht.commitCheck != nil {
+			iter = doltdb.NewFilteringCommitItr(iter, ht.commitCheck)
+		}
+		return &commitPartitioner{cmItr: iter}, nil
+
+	}
 	ht.indexLookup = lookup
 	return ht.Partitions(ctx)
 }
@@ -148,12 +171,11 @@ func (ht *HistoryTable) WithFilters(ctx *sql.Context, filters []sql.Expression) 
 	}
 
 	if len(ht.commitFilters) > 0 {
-		commitCheck, err := commitFilterForExprs(ctx, ht.commitFilters)
+		var err error
+		ht.commitCheck, err = commitFilterForExprs(ctx, ht.commitFilters)
 		if err != nil {
 			return sqlutil.NewStaticErrorTable(ht, err)
 		}
-
-		ht.cmItr = doltdb.NewFilteringCommitItr(ht.cmItr, commitCheck)
 	}
 
 	return ht
@@ -322,7 +344,11 @@ func (ht *HistoryTable) Collation() sql.CollationID {
 
 // Partitions returns a PartitionIter which will be used in getting partitions each of which is used to create RowIter.
 func (ht *HistoryTable) Partitions(ctx *sql.Context) (sql.PartitionIter, error) {
-	return &commitPartitioner{ht.cmItr}, nil
+	iter := ht.cmItr
+	if ht.commitCheck != nil {
+		iter = doltdb.NewFilteringCommitItr(iter, ht.commitCheck)
+	}
+	return &commitPartitioner{cmItr: iter}, nil
 }
 
 // PartitionRows takes a partition and returns a row iterator for that partition

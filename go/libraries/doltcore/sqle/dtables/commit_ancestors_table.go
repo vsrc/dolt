@@ -66,13 +66,21 @@ func (dt *CommitAncestorsTable) Partitions(*sql.Context) (sql.PartitionIter, err
 }
 
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition.
-func (dt *CommitAncestorsTable) PartitionRows(sqlCtx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
-	return NewCommitAncestorsRowItr(sqlCtx, dt.ddb)
+func (dt *CommitAncestorsTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
+	switch p := p.(type) {
+	case *doltdb.CommitPart:
+		return &CommitAncestorsRowItr{
+			itr: doltdb.NewOneCommitIter(p.Commit(), p.Hash(), p.Meta()),
+			ddb: dt.ddb,
+		}, nil
+	default:
+		return NewCommitAncestorsRowItr(ctx, dt.ddb)
+	}
 }
 
 // GetIndexes implements sql.IndexAddressable
 func (dt *CommitAncestorsTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltCommitIndexes("commit_hash", dt.Name(), dt.ddb)
+	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
 }
 
 // IndexedAccess implements sql.IndexAddressable
@@ -82,11 +90,11 @@ func (dt *CommitAncestorsTable) IndexedAccess(index sql.Index) sql.IndexedTable 
 }
 
 func (dt *CommitAncestorsTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
-	qualCol := lookup.Index.Expressions()[0]
-	col := qualCol[len(dt.Name()+"."):]
-
-	if col == "commit_hash" {
-		hs, _ := lookup.Ranges[0][0].LowerBound.(sql.Below).Key.(string)
+	if lookup.Index.ID() == index.CommitHashIndexId {
+		hs, ok := index.LookupToCommitPointSelect(lookup)
+		if !ok {
+			return dt.Partitions(ctx)
+		}
 		h, ok := hash.MaybeParse(hs)
 		if !ok {
 			return sql.PartitionsToPartitionIter(), nil
@@ -102,7 +110,7 @@ func (dt *CommitAncestorsTable) LookupPartitions(ctx *sql.Context, lookup sql.In
 			return nil, err
 		}
 
-		return &CommitPartIter{m: meta, h: h}, nil
+		return doltdb.NewOneCommitPartitionIter(h, cm, meta), nil
 	}
 
 	return dt.Partitions(ctx)

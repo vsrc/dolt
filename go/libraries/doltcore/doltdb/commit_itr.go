@@ -16,6 +16,7 @@ package doltdb
 
 import (
 	"context"
+	"github.com/dolthub/go-mysql-server/sql"
 	"io"
 
 	"github.com/dolthub/dolt/go/store/datas"
@@ -219,8 +220,8 @@ func (i *CommitIter) Reset(ctx context.Context) error {
 	return nil
 }
 
-func NewCommitSliceIter(cm []*Commit, h []hash.Hash) (*CommitSliceIter, error) {
-	return &CommitSliceIter{cm: cm, h: h}, nil
+func NewCommitSliceIter(cm []*Commit, h []hash.Hash) *CommitSliceIter {
+	return &CommitSliceIter{cm: cm, h: h}
 }
 
 type CommitSliceIter struct {
@@ -243,4 +244,95 @@ func (i *CommitSliceIter) Next(ctx context.Context) (hash.Hash, *Commit, error) 
 func (i *CommitSliceIter) Reset(ctx context.Context) error {
 	i.i = 0
 	return nil
+}
+
+func NewOneCommitIter(cm *Commit, h hash.Hash, meta *datas.CommitMeta) *OneCommitIter {
+	return &OneCommitIter{cm: cm, h: h}
+}
+
+type OneCommitIter struct {
+	h    hash.Hash
+	cm   *Commit
+	m    *datas.CommitMeta
+	done bool
+}
+
+var _ CommitItr = (*OneCommitIter)(nil)
+
+func (i *OneCommitIter) Next(_ context.Context) (hash.Hash, *Commit, error) {
+	if i.done {
+		return hash.Hash{}, nil, io.EOF
+	}
+	i.done = true
+	return i.h, i.cm, nil
+
+}
+
+func (i *OneCommitIter) Reset(_ context.Context) error {
+	i.done = false
+	return nil
+}
+
+func CommitIterForHash(ctx *sql.Context, h hash.Hash, ddb *DoltDB) (CommitItr, error) {
+	cm, err := HashToCommit(ctx, ddb.ValueReadWriter(), ddb.NodeStore(), h)
+	if err != nil {
+		return nil, err
+	}
+
+	meta, err := cm.GetCommitMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewOneCommitIter(cm, h, meta), nil
+}
+
+func NewOneCommitPartitionIter(h hash.Hash, cm *Commit, m *datas.CommitMeta) *OneCommitPartitionIter {
+	return &OneCommitPartitionIter{h: h, cm: cm, m: m}
+}
+
+type OneCommitPartitionIter struct {
+	h    hash.Hash
+	m    *datas.CommitMeta
+	cm   *Commit
+	done bool
+}
+
+var _ sql.PartitionIter = (*OneCommitPartitionIter)(nil)
+
+func (i *OneCommitPartitionIter) Next(ctx *sql.Context) (sql.Partition, error) {
+	if i.done {
+		return nil, io.EOF
+	}
+	i.done = true
+	return &CommitPart{h: i.h, m: i.m, cm: i.cm}, nil
+
+}
+
+func (i *OneCommitPartitionIter) Close(ctx *sql.Context) error {
+	return nil
+}
+
+type CommitPart struct {
+	h  hash.Hash
+	m  *datas.CommitMeta
+	cm *Commit
+}
+
+var _ sql.Partition = (*CommitPart)(nil)
+
+func (c *CommitPart) Hash() hash.Hash {
+	return c.h
+}
+
+func (c *CommitPart) Commit() *Commit {
+	return c.cm
+}
+
+func (c *CommitPart) Meta() *datas.CommitMeta {
+	return c.m
+}
+
+func (c *CommitPart) Key() []byte {
+	return c.h[:]
 }

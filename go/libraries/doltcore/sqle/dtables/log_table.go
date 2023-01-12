@@ -15,12 +15,9 @@
 package dtables
 
 import (
-	"github.com/dolthub/dolt/go/store/datas"
-	"github.com/dolthub/go-mysql-server/sql"
-	"io"
-
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions/commitwalk"
 	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
@@ -93,15 +90,15 @@ func (dt *LogTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition
 func (dt *LogTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
 	switch p := p.(type) {
-	case *commitPart:
-		return sql.RowsToRowIter(sql.NewRow(p.h.String(), p.m.Name, p.m.Email, p.m.Time(), p.m.Description)), nil
+	case *doltdb.CommitPart:
+		return sql.RowsToRowIter(sql.NewRow(p.Hash().String(), p.Meta().Name, p.Meta().Email, p.Meta().Time(), p.Meta().Description)), nil
 	default:
 		return NewLogItr(ctx, dt.ddb, dt.head)
 	}
 }
 
 func (dt *LogTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltCommitIndexes("commit_hash", dt.Name(), dt.ddb)
+	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
 }
 
 // IndexedAccess implements sql.IndexAddressable
@@ -111,11 +108,11 @@ func (dt *LogTable) IndexedAccess(index sql.Index) sql.IndexedTable {
 }
 
 func (dt *LogTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
-	qualCol := lookup.Index.Expressions()[0]
-	col := qualCol[len("dolt_log."):]
-
-	if col == "commit_hash" {
-		hs, _ := lookup.Ranges[0][0].LowerBound.(sql.Below).Key.(string)
+	if lookup.Index.ID() == index.CommitHashIndexId {
+		hs, ok := index.LookupToCommitPointSelect(lookup)
+		if !ok {
+			return dt.Partitions(ctx)
+		}
 		h, ok := hash.MaybeParse(hs)
 		if !ok {
 			return sql.PartitionsToPartitionIter(), nil
@@ -131,7 +128,7 @@ func (dt *LogTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (
 			return nil, err
 		}
 
-		return &CommitPartIter{m: meta, h: h}, nil
+		return doltdb.NewOneCommitPartitionIter(h, cm, meta), nil
 	}
 
 	return dt.Partitions(ctx)
@@ -176,37 +173,4 @@ func (itr *LogItr) Next(ctx *sql.Context) (sql.Row, error) {
 // Close closes the iterator.
 func (itr *LogItr) Close(*sql.Context) error {
 	return nil
-}
-
-type CommitPartIter struct {
-	h    hash.Hash
-	m    *datas.CommitMeta
-	done bool
-}
-
-var _ sql.PartitionIter = (*CommitPartIter)(nil)
-
-func (i *CommitPartIter) Next(ctx *sql.Context) (sql.Partition, error) {
-	if i.done {
-		return nil, io.EOF
-	}
-	i.done = true
-	return &commitPart{h: i.h, m: i.m}, nil
-
-}
-
-func (i *CommitPartIter) Close(ctx *sql.Context) error {
-	return nil
-}
-
-type commitPart struct {
-	h hash.Hash
-	m *datas.CommitMeta
-}
-
-var _ sql.Partition = (*commitPart)(nil)
-
-func (c *commitPart) Key() []byte {
-	//TODO implement me
-	panic("implement me")
 }

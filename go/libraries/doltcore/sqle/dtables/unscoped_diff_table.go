@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"io"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
@@ -46,7 +47,7 @@ type UnscopedDiffTable struct {
 	ddb              *doltdb.DoltDB
 	head             *doltdb.Commit
 	partitionFilters []sql.Expression
-	cmItr            doltdb.CommitItr
+	commitCheck      doltdb.CommitFilter
 }
 
 // tableChange is an internal data structure used to hold the results of processing
@@ -59,8 +60,7 @@ type tableChange struct {
 
 // NewUnscopedDiffTable creates an UnscopedDiffTable
 func NewUnscopedDiffTable(_ *sql.Context, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
-	cmItr := doltdb.CommitItrForRoots(ddb, head)
-	return &UnscopedDiffTable{ddb: ddb, head: head, cmItr: cmItr}
+	return &UnscopedDiffTable{ddb: ddb, head: head}
 }
 
 // Filters returns the list of filters that are applied to this table.
@@ -75,19 +75,13 @@ func (dt *UnscopedDiffTable) HandledFilters(filters []sql.Expression) []sql.Expr
 }
 
 // WithFilters returns a new sql.Table instance with the filters applied
-func (dt *UnscopedDiffTable) WithFilters(ctx *sql.Context, filters []sql.Expression) sql.Table {
+func (dt *UnscopedDiffTable) WithFilters(_ *sql.Context, filters []sql.Expression) sql.Table {
 	dt.partitionFilters = FilterFilters(filters, ColumnPredicate(filterColumnNameSet))
-
-	if len(dt.partitionFilters) > 0 {
-		commitCheck, err := commitFilterForDiffTableFilterExprs(dt.partitionFilters)
-		if err != nil {
-			return nil
-		}
-		ndt := *dt
-		ndt.cmItr = doltdb.NewFilteringCommitItr(dt.cmItr, commitCheck)
-		return &ndt
+	commitCheck, err := commitFilterForDiffTableFilterExprs(dt.partitionFilters)
+	if err != nil {
+		return nil
 	}
-
+	dt.commitCheck = commitCheck
 	return dt
 }
 
@@ -133,13 +127,67 @@ func (dt *UnscopedDiffTable) Partitions(ctx *sql.Context) (sql.PartitionIter, er
 
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition.
 func (dt *UnscopedDiffTable) PartitionRows(ctx *sql.Context, partition sql.Partition) (sql.RowIter, error) {
-	if bytes.Equal(partition.Key(), workingSetPartitionKey) {
-		return dt.newWorkingSetRowItr(ctx)
-	} else if bytes.Equal(partition.Key(), commitHistoryPartitionKey) {
-		return dt.newCommitHistoryRowItr(ctx)
-	} else {
-		return nil, fmt.Errorf("unexpected partition: %v", partition)
+	switch p := partition.(type) {
+	case *doltdb.CommitPart:
+		return dt.newCommitHistoryRowItrFromCommits(ctx, []*doltdb.Commit{p.Commit()})
+	default:
+		if bytes.Equal(partition.Key(), workingSetPartitionKey) {
+			return dt.newWorkingSetRowItr(ctx)
+		} else if bytes.Equal(partition.Key(), commitHistoryPartitionKey) {
+			cms, hasCommitHashEquality := getCommitsFromCommitHashEquality(ctx, dt.ddb, dt.partitionFilters)
+			if hasCommitHashEquality {
+				return dt.newCommitHistoryRowItrFromCommits(ctx, cms)
+			}
+			iter := doltdb.CommitItrForRoots(dt.ddb, dt.head)
+			if dt.commitCheck != nil {
+				iter = doltdb.NewFilteringCommitItr(iter, dt.commitCheck)
+			}
+			return dt.newCommitHistoryRowItrFromItr(ctx, iter)
+		} else {
+			return nil, fmt.Errorf("unexpected partition: %v", partition)
+		}
 	}
+}
+
+// GetIndexes implements sql.IndexAddressable
+func (dt *UnscopedDiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
+}
+
+// IndexedAccess implements sql.IndexAddressable
+func (dt *UnscopedDiffTable) IndexedAccess(index sql.Index) sql.IndexedTable {
+	nt := *dt
+	return &nt
+}
+
+func (dt *UnscopedDiffTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	if lookup.Index.ID() == index.CommitHashIndexId {
+		hs, ok := index.LookupToCommitPointSelect(lookup)
+		if !ok {
+			return dt.Partitions(ctx)
+		}
+		if hs == "WORKING" {
+			return dt.Partitions(ctx)
+		}
+		h, ok := hash.MaybeParse(hs)
+		if !ok {
+			return sql.PartitionsToPartitionIter(), nil
+		}
+
+		cm, err := doltdb.HashToCommit(ctx, dt.ddb.ValueReadWriter(), dt.ddb.NodeStore(), h)
+		if err != nil {
+			return nil, err
+		}
+
+		meta, err := cm.GetCommitMeta(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return doltdb.NewOneCommitPartitionIter(h, cm, meta), nil
+	}
+
+	return dt.Partitions(ctx)
 }
 
 func (dt *UnscopedDiffTable) newWorkingSetRowItr(ctx *sql.Context) (sql.RowIter, error) {
@@ -243,17 +291,23 @@ type doltDiffCommitHistoryRowItr struct {
 }
 
 // newCommitHistoryRowItr creates a doltDiffCommitHistoryRowItr from the current environment.
-func (dt *UnscopedDiffTable) newCommitHistoryRowItr(ctx *sql.Context) (*doltDiffCommitHistoryRowItr, error) {
+func (dt *UnscopedDiffTable) newCommitHistoryRowItrFromItr(ctx *sql.Context, iter doltdb.CommitItr) (*doltDiffCommitHistoryRowItr, error) {
 	dchItr := &doltDiffCommitHistoryRowItr{
 		ctx:             ctx,
 		ddb:             dt.ddb,
 		tableChangesIdx: -1,
+		child:           iter,
 	}
-	cms, hasCommitHashEquality := getCommitsFromCommitHashEquality(ctx, dt.ddb, dt.partitionFilters)
-	if hasCommitHashEquality {
-		dchItr.commits = cms
-	} else {
-		dchItr.child = dt.cmItr
+	return dchItr, nil
+}
+
+// newCommitHistoryRowItr creates a doltDiffCommitHistoryRowItr from the current environment.
+func (dt *UnscopedDiffTable) newCommitHistoryRowItrFromCommits(ctx *sql.Context, commits []*doltdb.Commit) (*doltDiffCommitHistoryRowItr, error) {
+	dchItr := &doltDiffCommitHistoryRowItr{
+		ctx:             ctx,
+		ddb:             dt.ddb,
+		tableChangesIdx: -1,
+		commits:         commits,
 	}
 	return dchItr, nil
 }

@@ -34,6 +34,11 @@ import (
 	"github.com/dolthub/dolt/go/store/val"
 )
 
+const (
+	CommitHashIndexId = "commit_hash"
+	ToCommitIndexId   = "to_commit"
+)
+
 type DoltTableable interface {
 	DoltTable(*sql.Context) (*doltdb.Table, error)
 	DataCacheKey(*sql.Context) (doltdb.DataCacheKey, bool, error)
@@ -53,6 +58,7 @@ type DoltIndex interface {
 	lookupTags(s *durableIndexState) map[uint64]int
 }
 
+// TODO from_commit
 func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Table) (indexes []sql.Index, err error) {
 	sch, err := t.GetSchema(ctx)
 	if err != nil {
@@ -98,81 +104,40 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 
 	indexes = append(indexes, &toIndex)
 	indexes = append(indexes, &doltIndex{
-		id:      "to_commit",
+		id:      ToCommitIndexId,
 		tblName: doltdb.DoltDiffTablePrefix + tbl,
 		dbName:  db,
 		columns: []schema.Column{
 			schema.NewColumn("to_commit", schema.DiffCommitTag, types.StringKind, false),
 		},
-		indexSch: sch,
-		tableSch: sch,
-		unique:   true,
-		comment:  "",
-		vrw:      t.ValueReadWriter(),
-		ns:       t.NodeStore(),
-		//keyBld:                        keyBld,
-		order:                         sql.IndexOrderAsc,
-		constrainedToLookupExpression: false,
-	})
-	indexes = append(indexes, &doltIndex{
-		id:      "from_commit",
-		tblName: doltdb.DoltDiffTablePrefix + tbl,
-		dbName:  db,
-		columns: []schema.Column{
-			schema.NewColumn("from_commit", schema.DiffCommitTag, types.StringKind, false),
-		},
-		indexSch: sch,
-		tableSch: sch,
-		unique:   true,
-		comment:  "",
-		vrw:      t.ValueReadWriter(),
-		ns:       t.NodeStore(),
-		//keyBld:                        keyBld,
+		indexSch:                      sch,
+		tableSch:                      sch,
+		unique:                        true,
+		comment:                       "",
+		vrw:                           t.ValueReadWriter(),
+		ns:                            t.NodeStore(),
 		order:                         sql.IndexOrderAsc,
 		constrainedToLookupExpression: false,
 	})
 	return indexes, nil
 }
 
-func DoltLogIndexes(ctx *sql.Context, dt sql.Table, db *doltdb.DoltDB) (indexes []sql.Index, err error) {
+func DoltCommitIndexes(tab string, db *doltdb.DoltDB, unique bool) (indexes []sql.Index, err error) {
 	return []sql.Index{
 		&doltIndex{
-			id:      "commit_hash",
-			tblName: doltdb.LogTableName,
-			dbName:  "",
-			columns: []schema.Column{
-				schema.NewColumn("commit_hash", 0, types.StringKind, false),
-			},
-			indexSch: nil,
-			tableSch: nil,
-			unique:   true,
-			comment:  "",
-			vrw:      db.ValueReadWriter(),
-			ns:       db.NodeStore(),
-			//keyBld:                        keyBld,
-			order:                         sql.IndexOrderAsc,
-			constrainedToLookupExpression: false,
-		},
-	}, nil
-}
-
-func DoltCommitIndexes(col, tab string, db *doltdb.DoltDB) (indexes []sql.Index, err error) {
-	return []sql.Index{
-		&doltIndex{
-			id:      col,
+			id:      CommitHashIndexId,
 			tblName: tab,
 			dbName:  "",
 			columns: []schema.Column{
-				schema.NewColumn(col, 0, types.StringKind, false),
+				schema.NewColumn(CommitHashIndexId, 0, types.StringKind, false),
 			},
-			indexSch: nil,
-			tableSch: nil,
-			unique:   true,
-			comment:  "",
-			vrw:      db.ValueReadWriter(),
-			ns:       db.NodeStore(),
-			//keyBld:                        keyBld,
-			order:                         sql.IndexOrderAsc,
+			indexSch:                      nil,
+			tableSch:                      nil,
+			unique:                        unique,
+			comment:                       "",
+			vrw:                           db.ValueReadWriter(),
+			ns:                            db.NodeStore(),
+			order:                         sql.IndexOrderNone,
 			constrainedToLookupExpression: false,
 		},
 	}, nil
@@ -252,7 +217,7 @@ func indexesMatch(a sql.Index, b sql.Index) bool {
 	return true
 }
 
-func DoltHistoryIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Table) ([]sql.Index, error) {
+func DoltHistoryIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Table, ddb *doltdb.DoltDB) ([]sql.Index, error) {
 	indexes, err := DoltIndexesFromTable(ctx, db, tbl, t)
 	if err != nil {
 		return nil, err
@@ -267,6 +232,12 @@ func DoltHistoryIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.
 		di.constrainedToLookupExpression = false
 		unorderedIndexes[i] = di
 	}
+
+	cmIdx, err := DoltCommitIndexes(tbl, ddb, false)
+	if err != nil {
+		return nil, err
+	}
+	unorderedIndexes = append(unorderedIndexes, cmIdx...)
 
 	return unorderedIndexes, nil
 }
@@ -1055,4 +1026,20 @@ func SplitNullsFromRanges(rs []sql.Range) ([]sql.Range, error) {
 		ret = append(ret, nr...)
 	}
 	return ret, nil
+}
+
+func LookupToCommitPointSelect(lookup sql.IndexLookup) (string, bool) {
+	if len(lookup.Ranges) != 1 || !lookup.IsPointLookup {
+		return "", false
+	}
+	bound, ok := lookup.Ranges[0][0].LowerBound.(sql.Below)
+	if !ok {
+		return "", false
+	}
+	k, ok := bound.Key.(string)
+	if !ok {
+		return "", false
+	}
+
+	return k, true
 }

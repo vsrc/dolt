@@ -15,6 +15,8 @@
 package dtables
 
 import (
+	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -68,8 +70,51 @@ func (dt *CommitsTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 }
 
 // PartitionRows is a sql.Table interface function that gets a row iterator for a partition.
-func (dt *CommitsTable) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.RowIter, error) {
-	return NewCommitsRowItr(ctx, dt.ddb)
+func (dt *CommitsTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
+	switch p := p.(type) {
+	case *doltdb.CommitPart:
+		return sql.RowsToRowIter(formatCommitTableRow(p.Hash(), p.Meta())), nil
+	default:
+		return NewCommitsRowItr(ctx, dt.ddb)
+	}
+}
+
+// GetIndexes implements sql.IndexAddressable
+func (dt *CommitsTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
+}
+
+// IndexedAccess implements sql.IndexAddressable
+func (dt *CommitsTable) IndexedAccess(index sql.Index) sql.IndexedTable {
+	nt := *dt
+	return &nt
+}
+
+func (dt *CommitsTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	if lookup.Index.ID() == index.CommitHashIndexId {
+		hs, ok := index.LookupToCommitPointSelect(lookup)
+		if !ok {
+			return dt.Partitions(ctx)
+		}
+		h, ok := hash.MaybeParse(hs)
+		if !ok {
+			return sql.PartitionsToPartitionIter(), nil
+		}
+
+		cm, err := doltdb.HashToCommit(ctx, dt.ddb.ValueReadWriter(), dt.ddb.NodeStore(), h)
+		if err != nil {
+			return nil, err
+		}
+
+		meta, err := cm.GetCommitMeta(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return doltdb.NewOneCommitPartitionIter(h, cm, meta), nil
+	}
+
+	return dt.Partitions(ctx)
 }
 
 // CommitsRowItr is a sql.RowItr which iterates over each commit as if it's a row in the table.
@@ -100,10 +145,14 @@ func (itr CommitsRowItr) Next(ctx *sql.Context) (sql.Row, error) {
 		return nil, err
 	}
 
-	return sql.NewRow(h.String(), meta.Name, meta.Email, meta.Time(), meta.Description), nil
+	return formatCommitTableRow(h, meta), nil
 }
 
 // Close closes the iterator.
 func (itr CommitsRowItr) Close(*sql.Context) error {
 	return nil
+}
+
+func formatCommitTableRow(h hash.Hash, meta *datas.CommitMeta) sql.Row {
+	return sql.NewRow(h.String(), meta.Name, meta.Email, meta.Time(), meta.Description)
 }
