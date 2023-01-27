@@ -15,6 +15,7 @@
 package nbs
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -24,8 +25,12 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/util/tempfiles"
 )
 
 var chunkJournalFeatureFlag = false
@@ -49,7 +54,34 @@ func UseJournalStore(path string) bool {
 
 const (
 	chunkJournalName = chunkJournalAddr // todo
+	tmpJournalPrefix = "nbs_journal_"
 )
+
+type journalConjoiner struct {
+	child conjoinStrategy
+}
+
+func (c journalConjoiner) conjoinRequired(ts tableSet) bool {
+	return c.child.conjoinRequired(ts)
+}
+
+func (c journalConjoiner) chooseConjoinees(upstream []tableSpec) (conjoinees, keepers []tableSpec, err error) {
+	var stash tableSpec // don't conjoin journal
+	pruned := make([]tableSpec, 0, len(upstream))
+	for _, ts := range upstream {
+		if isJournalAddr(ts.name) {
+			stash = ts
+		} else {
+			pruned = append(pruned, ts)
+		}
+	}
+	conjoinees, keepers, err = c.child.chooseConjoinees(pruned)
+	if err != nil {
+		return nil, nil, err
+	}
+	keepers = append(keepers, stash)
+	return
+}
 
 // chunkJournal is a persistence abstraction for a NomsBlockStore.
 // It implemented both manifest and tablePersister, durably writing
@@ -329,28 +361,105 @@ func (j *chunkJournal) Close() (err error) {
 	return
 }
 
-type journalConjoiner struct {
-	child conjoinStrategy
-}
+func (j *chunkJournal) rotateJournalFile(ctx context.Context) (chunkSource, error) {
+	var (
+		spec    tableSpec
+		wr      *journalWriter
+		tmpPath string
+	)
 
-func (c journalConjoiner) conjoinRequired(ts tableSet) bool {
-	return c.child.conjoinRequired(ts)
-}
-
-func (c journalConjoiner) chooseConjoinees(upstream []tableSpec) (conjoinees, keepers []tableSpec, err error) {
-	var stash tableSpec // don't conjoin journal
-	pruned := make([]tableSpec, 0, len(upstream))
-	for _, ts := range upstream {
-		if isJournalAddr(ts.name) {
-			stash = ts
-		} else {
-			pruned = append(pruned, ts)
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.Go(func() (err error) {
+		dir := filepath.Dir(j.path)
+		spec, err = convertJournalToTable(ectx, dir)
+		return
+	})
+	eg.Go(func() (err error) {
+		tmpPath = tmpJournalPath()
+		wr, err = createJournalWriter(ectx, tmpPath)
+		if err != nil {
+			return err
 		}
+		// write current root hash to new journal
+		if err = wr.WriteRootHash(j.contents.root); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
-	conjoinees, keepers, err = c.child.chooseConjoinees(pruned)
+
+	contents, err := addTableToManifest(ctx, j.backing, j.contents, spec)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	keepers = append(keepers, stash)
+	j.contents = contents
+
+	// clobber the existing journal
+	if err = os.Rename(tmpPath, j.path); err != nil {
+		return nil, err
+	}
+
+	j.src = journalChunkSource{
+		journal: wr,
+		address: journalAddr,
+		lookups: newLookupMap(),
+	}
+	j.wr = wr
+
+	// return a chunkSource from the table file
+	return j.persister.Open(ctx, spec.name, spec.chunkCount, new(Stats))
+}
+
+func convertJournalToTable(ctx context.Context, nbsPath string) (spec tableSpec, err error) {
+	if nbsPath, err = filepath.Abs(nbsPath); err != nil {
+		return tableSpec{}, err
+	}
+
+	j, err := os.Open(filepath.Join(nbsPath, chunkJournalName))
+	if err != nil {
+		return tableSpec{}, err
+	}
+
+	tmp, err := tempfiles.MovableTempFileProvider.NewFile(nbsPath, tempTablePrefix)
+	if err != nil {
+		return tableSpec{}, err
+	}
+	defer func() {
+		if cerr := tmp.Close(); cerr != nil {
+			err = cerr
+		}
+	}()
+
+	wr := bufio.NewWriterSize(tmp, 65536)
+	spec, err = writeJournalToTable(ctx, j, wr)
+	if err != nil {
+		return tableSpec{}, err
+	}
+
+	if err = wr.Flush(); err != nil {
+		return tableSpec{}, err
+	} else if err = tmp.Sync(); err != nil {
+		return tableSpec{}, err
+	}
+
+	tp := filepath.Join(nbsPath, spec.name.String())
+	if err = os.Rename(tmp.Name(), tp); err != nil {
+		return tableSpec{}, nil
+	}
 	return
+}
+
+func addTableToManifest(ctx context.Context, m manifest, mc manifestContents, spec tableSpec) (manifestContents, error) {
+	update := mc
+	update.specs = append([]tableSpec{spec}, update.specs...)
+	update.lock = generateLockHash(update.root, update.specs, update.appendix)
+	return m.Update(ctx, mc.lock, update, new(Stats), nil)
+}
+
+func tmpJournalPath() string {
+	d := tempfiles.MovableTempFileProvider.GetTempDir()
+	f := tmpJournalPrefix + uuid.New().String()
+	return filepath.Join(d, f)
 }
