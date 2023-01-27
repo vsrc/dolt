@@ -92,7 +92,7 @@ func createJournalWriter(ctx context.Context, path string) (wr *journalWriter, e
 
 	_, err = os.Stat(path)
 	if err == nil {
-		return nil, fmt.Errorf("journal file %s already exists", chunkJournalName)
+		return nil, fmt.Errorf("journal file at %s already exists", path)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -187,7 +187,13 @@ func (wr *journalWriter) Snapshot() (io.Reader, int64, error) {
 func (wr *journalWriter) CurrentSize() int64 {
 	wr.lock.RLock()
 	defer wr.lock.RUnlock()
-	return wr.off
+	return wr.offset()
+}
+
+func (wr *journalWriter) IsFull() bool {
+	wr.lock.RLock()
+	defer wr.lock.RUnlock()
+	return wr.offset() > chunkJournalFileSize
 }
 
 func (wr *journalWriter) Write(p []byte) (n int, err error) {
@@ -314,5 +320,41 @@ func (wr *journalWriter) flush() (err error) {
 	}
 	wr.off += int64(len(wr.buf))
 	wr.buf = wr.buf[:0]
+	return
+}
+
+// todo: table file addr name
+func writeJournalToTable(ctx context.Context, journal io.ReadSeeker, wr io.Writer) (spec tableSpec, err error) {
+	var uncompressed uint64
+	prefixes := make([]prefixIndexRec, 0, 1024)
+	_, err = processRecords(ctx, journal, func(_ int64, r journalRec) (err error) {
+		if r.kind != chunkRecKind {
+			return
+		}
+		if _, err = wr.Write(r.payload); err != nil {
+			return
+		}
+		spec.chunkCount++
+		prefixes = append(prefixes, prefixIndexRec{
+			prefix: r.address.Prefix(),
+			suffix: r.address.Suffix(),
+			order:  uint32(len(prefixes)),
+			size:   uint32(len(r.payload)),
+		})
+		uncompressed += r.uncompressedPayloadSize()
+		return
+	})
+
+	cnt := uint32(len(prefixes))
+	buf := make([]byte, indexSize(cnt)+footerSize)
+
+	var off uint64
+	off, spec.name, err = writeChunkIndex(buf, prefixes)
+	if err != nil {
+		return
+	}
+	writeFooter(buf[off:], cnt, uncompressed)
+
+	_, err = wr.Write(buf)
 	return
 }
