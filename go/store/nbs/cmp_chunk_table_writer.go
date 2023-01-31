@@ -17,11 +17,13 @@ package nbs
 import (
 	"crypto/sha512"
 	"encoding/binary"
+	"fmt"
 	"errors"
 	"hash"
 	"io"
 	"os"
 	"sort"
+	"runtime/debug"
 
 	"github.com/golang/snappy"
 
@@ -81,7 +83,7 @@ func (tw *CmpChunkTableWriter) AddCmpChunk(c CompressedChunk) error {
 	}
 
 	if tw.chunkHashes.Has(c.H) {
-		return ErrChunkAlreadyWritten
+		return fmt.Errorf("%s: %w\n%s", c.H.String(), ErrChunkAlreadyWritten, string(debug.Stack()))
 	}
 
 	tw.chunkHashes.Insert(c.H)

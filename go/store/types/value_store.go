@@ -26,12 +26,14 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/d"
+	"github.com/dolthub/dolt/go/store/nbs"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/util/sizecache"
 )
@@ -96,7 +98,7 @@ func ErrorIfDangling(ctx context.Context, unresolved hash.HashSet, cs chunks.Chu
 
 	if len(absent) != 0 {
 		s := absent.String()
-		return fmt.Errorf("Found dangling references to %s", s)
+		return fmt.Errorf("Found dangling references to %s\n%s", s, string(debug.Stack()))
 	}
 
 	return nil
@@ -166,7 +168,7 @@ func newValueStoreWithCacheAndPending(cs chunks.ChunkStore, cacheSize, pendingMa
 		withBufferedChildren: map[hash.Hash]uint64{},
 		decodedChunks:        sizecache.New(cacheSize),
 		unresolvedRefs:       hash.HashSet{},
-		enforceCompleteness:  true,
+		enforceCompleteness:  false,
 		versOnce:             sync.Once{},
 	}
 }
@@ -182,6 +184,7 @@ func (lvs *ValueStore) expectVersion() {
 
 func (lvs *ValueStore) SetEnforceCompleteness(enforce bool) {
 	lvs.enforceCompleteness = enforce
+	lvs.enforceCompleteness = false
 }
 
 func (lvs *ValueStore) SetValidateContentAddresses(validate bool) {
@@ -644,6 +647,7 @@ func (lvs *ValueStore) flush(ctx context.Context, current hash.Hash) error {
 
 		err = ErrorIfDangling(ctx, lvs.unresolvedRefs, lvs.cs)
 		if err != nil {
+			lvs.unresolvedRefs = hash.HashSet{}
 			return err
 		}
 	}
@@ -746,16 +750,24 @@ func (lvs *ValueStore) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashS
 			return err
 		}
 
-		return lvs.gc(ctx, root, newGenRefs, oldGen.HasMany, newGen, newGen)
+		err = lvs.gc(ctx, root, newGenRefs, oldGen.HasMany, newGen, newGen)
+		if err != nil {
+			return err
+		}
 	} else if collector, ok := lvs.cs.(chunks.ChunkStoreGarbageCollector); ok {
 		if len(oldGenRefs) > 0 {
 			newGenRefs.InsertAll(oldGenRefs)
 		}
 
-		return lvs.gc(ctx, root, newGenRefs, unfilteredHashFunc, collector, collector)
+		err = lvs.gc(ctx, root, newGenRefs, unfilteredHashFunc, collector, collector)
+		if err != nil {
+			return err
+		}
 	} else {
 		return chunks.ErrUnsupportedOperation
 	}
+
+	return lvs.cs.(nbs.TableFileStore).PruneTableFiles(ctx)
 }
 
 func (lvs *ValueStore) gc(ctx context.Context, root hash.Hash, toVisit hash.HashSet, hashFilter HashFilterFunc, src, dest chunks.ChunkStoreGarbageCollector) error {
@@ -801,11 +813,6 @@ func (lvs *ValueStore) gc(ctx context.Context, root hash.Hash, toVisit hash.Hash
 		close(keepChunks)
 		return nil
 	})
-
-	err := eg.Wait()
-	if err != nil {
-		return err
-	}
 
 	return eg.Wait()
 }

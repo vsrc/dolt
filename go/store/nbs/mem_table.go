@@ -152,9 +152,10 @@ func (mt *memTable) get(ctx context.Context, h addr, stats *Stats) ([]byte, erro
 
 func (mt *memTable) getMany(ctx context.Context, eg *errgroup.Group, reqs []getRecord, found func(context.Context, *chunks.Chunk), stats *Stats) (bool, error) {
 	var remaining bool
-	for _, r := range reqs {
+	for i, r := range reqs {
 		data := mt.chunks[*r.a]
 		if data != nil {
+			reqs[i].found = true
 			c := chunks.NewChunkWithHash(hash.Hash(*r.a), data)
 			found(ctx, &c)
 		} else {
@@ -166,9 +167,10 @@ func (mt *memTable) getMany(ctx context.Context, eg *errgroup.Group, reqs []getR
 
 func (mt *memTable) getManyCompressed(ctx context.Context, eg *errgroup.Group, reqs []getRecord, found func(context.Context, CompressedChunk), stats *Stats) (bool, error) {
 	var remaining bool
-	for _, r := range reqs {
+	for i, r := range reqs {
 		data := mt.chunks[*r.a]
 		if data != nil {
+			reqs[i].found = true
 			c := chunks.NewChunkWithHash(hash.Hash(*r.a), data)
 			found(ctx, ChunkToCompressedChunk(c))
 		} else {

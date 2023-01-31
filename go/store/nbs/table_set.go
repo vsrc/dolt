@@ -24,6 +24,7 @@ package nbs
 import (
 	"bytes"
 	"context"
+	"runtime/debug"
 	"errors"
 	"fmt"
 	"sort"
@@ -32,6 +33,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
 )
 
 const concurrentCompactions = 5
@@ -42,10 +44,10 @@ func newTableSet(p tablePersister, q MemoryQuotaProvider) tableSet {
 
 // tableSet is an immutable set of persistable chunkSources.
 type tableSet struct {
-	novel, upstream chunkSourceSet
-	p               tablePersister
-	q               MemoryQuotaProvider
-	rl              chan struct{}
+	novel, upstream  chunkSourceSet
+	p                tablePersister
+	q                MemoryQuotaProvider
+	rl               chan struct{}
 }
 
 func (ts tableSet) has(h addr) (bool, error) {
@@ -273,20 +275,34 @@ func (ts tableSet) Size() int {
 	return len(ts.novel) + len(ts.upstream)
 }
 
+var ErrDanglingReferences = errors.New("dangling references")
+
 // append adds a memTable to an existing tableSet, compacting |mt| and
 // returning a new tableSet with newly compacted table added.
-func (ts tableSet) append(ctx context.Context, mt *memTable, stats *Stats) (tableSet, error) {
+func (ts tableSet) append(ctx context.Context, mt *memTable, checker refCheck, stats *Stats) (tableSet, error) {
+	var err error
+	var absent hash.HashSet
+	if mt != nil && mt.pendingRefs != nil {
+		sort.Sort(hasRecordByPrefix(mt.pendingRefs))
+		absent, err = checker(mt.pendingRefs)
+		if err != nil {
+			return tableSet{}, err
+		} else if absent.Size() > 0 {
+			return tableSet{}, fmt.Errorf("%w: found dangling references to memtable pendingRefs %s\n%s", ErrDanglingReferences, absent.String(), string(debug.Stack()))
+		}
+	}
+
 	cs, err := ts.p.Persist(ctx, mt, ts, stats)
 	if err != nil {
 		return tableSet{}, err
 	}
 
 	newTs := tableSet{
-		novel:    copyChunkSourceSet(ts.novel),
-		upstream: copyChunkSourceSet(ts.upstream),
-		p:        ts.p,
-		q:        ts.q,
-		rl:       ts.rl,
+		novel:            copyChunkSourceSet(ts.novel),
+		upstream:         copyChunkSourceSet(ts.upstream),
+		p:                ts.p,
+		q:                ts.q,
+		rl:               ts.rl,
 	}
 	newTs.novel[cs.hash()] = cs
 	return newTs, nil
