@@ -406,7 +406,12 @@ func (lvs *ValueStore) WriteValue(ctx context.Context, v Value) (Ref, error) {
 //     lvs.bufferedChunksMax
 func (lvs *ValueStore) bufferChunk(ctx context.Context, v Value, c chunks.Chunk, height uint64) error {
 	lvs.bufferMu.Lock()
-	defer lvs.bufferMu.Unlock()
+	didUnlock := false
+	defer func() {
+		if !didUnlock {
+			lvs.bufferMu.Unlock()
+		}
+	}()
 
 	if lvs.Format().UsesFlatbuffers() {
 		// We do not do write buffering in the new format.
@@ -425,6 +430,8 @@ func (lvs *ValueStore) bufferChunk(ctx context.Context, v Value, c chunks.Chunk,
 			}
 			lvs.unresolvedRefs.InsertAll(addrs)
 		}
+		didUnlock = true
+		lvs.bufferMu.Unlock()
 		return lvs.cs.Put(ctx, c, lvs.getAddrs)
 	}
 
@@ -436,11 +443,14 @@ func (lvs *ValueStore) bufferChunk(ctx context.Context, v Value, c chunks.Chunk,
 	}
 
 	put := func(h hash.Hash, c chunks.Chunk) error {
+		didUnlock = true
+		lvs.bufferMu.Unlock()
 		err := lvs.cs.Put(ctx, c, lvs.getAddrs)
-
 		if err != nil {
 			return err
 		}
+		lvs.bufferMu.Lock()
+		didUnlock = false
 
 		lvs.bufferedChunkSize -= uint64(len(c.Data()))
 		delete(lvs.bufferedChunks, h)
@@ -547,17 +557,26 @@ func (lvs *ValueStore) Rebase(ctx context.Context) error {
 }
 
 func (lvs *ValueStore) Flush(ctx context.Context) error {
-	lvs.bufferMu.Lock()
-	defer lvs.bufferMu.Unlock()
 	return lvs.flush(ctx, hash.Hash{})
 }
 
 func (lvs *ValueStore) flush(ctx context.Context, current hash.Hash) error {
+	lvs.bufferMu.Lock()
+	didUnlock := false
+	defer func() {
+		if !didUnlock {
+			lvs.bufferMu.Unlock()
+		}
+	}()
 	put := func(h hash.Hash, chunk chunks.Chunk) error {
+		didUnlock = true
+		lvs.bufferMu.Unlock()
 		err := lvs.cs.Put(ctx, chunk, lvs.getAddrs)
 		if err != nil {
 			return err
 		}
+		lvs.bufferMu.Lock()
+		didUnlock = false
 
 		delete(lvs.bufferedChunks, h)
 		delete(lvs.withBufferedChildren, h)
@@ -588,10 +607,14 @@ func (lvs *ValueStore) flush(ctx context.Context, current hash.Hash) error {
 	}
 	for _, c := range lvs.bufferedChunks {
 		// Can't use put() because it's wrong to delete from a lvs.bufferedChunks while iterating it.
+		didUnlock = true
+		lvs.bufferMu.Unlock()
 		err := lvs.cs.Put(ctx, c, lvs.getAddrs)
 		if err != nil {
 			return err
 		}
+		lvs.bufferMu.Lock()
+		didUnlock = false
 
 		lvs.bufferedChunkSize -= uint64(len(c.Data()))
 	}
@@ -601,11 +624,14 @@ func (lvs *ValueStore) flush(ctx context.Context, current hash.Hash) error {
 	lvs.bufferedChunks = map[hash.Hash]chunks.Chunk{}
 
 	if lvs.enforceCompleteness {
+		didUnlock = true
+		lvs.bufferMu.Unlock()
 		root, err := lvs.Root(ctx)
-
 		if err != nil {
 			return err
 		}
+		lvs.bufferMu.Lock()
+		didUnlock = false
 
 		if (current != hash.Hash{} && current != root) {
 			if _, ok := lvs.bufferedChunks[current]; !ok {
@@ -632,9 +658,6 @@ func (lvs *ValueStore) flush(ctx context.Context, current hash.Hash) error {
 // rebased. Until Commit() succeeds, no work of the ValueStore will be visible
 // to other readers of the underlying ChunkStore.
 func (lvs *ValueStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {
-	lvs.bufferMu.Lock()
-	defer lvs.bufferMu.Unlock()
-
 	err := lvs.flush(ctx, current)
 	if err != nil {
 		return false, err
@@ -647,6 +670,9 @@ func (lvs *ValueStore) Commit(ctx context.Context, current, last hash.Hash) (boo
 	if !success {
 		return false, nil
 	}
+
+	lvs.bufferMu.Lock()
+	defer lvs.bufferMu.Unlock()
 
 	if lvs.enforceCompleteness {
 		lvs.unresolvedRefs = hash.HashSet{}
@@ -694,22 +720,9 @@ func (lvs *ValueStore) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashS
 		return errors.New("invalid GC state; bufferedChunks must be empty.")
 	}
 
-	err := func() error {
-		lvs.bufferMu.RLock()
-		defer lvs.bufferMu.RUnlock()
-		if len(lvs.bufferedChunks) > 0 {
-			return errors.New("invalid GC state; bufferedChunks must be empty.")
-		}
-		return nil
-	}()
-	if err != nil {
-		return err
-	}
-
 	lvs.versOnce.Do(lvs.expectVersion)
 
 	root, err := lvs.Root(ctx)
-
 	if err != nil {
 		return err
 	}

@@ -392,6 +392,9 @@ func OverwriteStoreManifest(ctx context.Context, store *NomsBlockStore, root has
 	}
 	contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix)
 
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
 	store.mm.LockForUpdate()
 	defer func() {
 		unlockErr := store.mm.UnlockForUpdate()
@@ -400,8 +403,6 @@ func OverwriteStoreManifest(ctx context.Context, store *NomsBlockStore, root has
 			err = unlockErr
 		}
 	}()
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	updatedContents, err := store.mm.Update(ctx, store.upstream.lock, contents, store.stats, nil)
 	if err != nil {
 		return err
@@ -997,6 +998,7 @@ func (nbs *NomsBlockStore) commit(ctx context.Context, current, last hash.Hash, 
 	// check for dangling references in |nbs.mt|
 	nbs.mu.Lock()
 	if err = nbs.errorIfDangling(checker); err != nil {
+		nbs.mu.Unlock()
 		return false, err
 	}
 	nbs.mu.Unlock()
@@ -1117,7 +1119,7 @@ func (nbs *NomsBlockStore) updateManifest(ctx context.Context, current, last has
 		}
 	}
 
-	if nbs.c.conjoinRequired(nbs.tables) {
+	if nbs.c.conjoinRequired(nbs.tables) && false {
 		newUpstream, err := conjoin(ctx, nbs.c, nbs.upstream, nbs.mm, nbs.p, nbs.stats)
 		if err != nil {
 			return err
@@ -1611,6 +1613,9 @@ func (nbs *NomsBlockStore) gcTableSize() (uint64, error) {
 }
 
 func (nbs *NomsBlockStore) swapTables(ctx context.Context, specs []tableSpec) (err error) {
+	nbs.mu.Lock()
+	defer nbs.mu.Unlock()
+
 	nbs.mm.LockForUpdate()
 	defer func() {
 		unlockErr := nbs.mm.UnlockForUpdate()
@@ -1618,9 +1623,6 @@ func (nbs *NomsBlockStore) swapTables(ctx context.Context, specs []tableSpec) (e
 			err = unlockErr
 		}
 	}()
-
-	nbs.mu.Lock()
-	defer nbs.mu.Unlock()
 
 	newLock := generateLockHash(nbs.upstream.root, specs, []tableSpec{})
 	newContents := manifestContents{
