@@ -308,48 +308,74 @@ func (s *stats) read() Stats {
 // over channels.  They all run within the same errgroup and they all listen
 // for ctx.Done on every channel send and receive.
 //
-// uploadTempTableFiles is a goroutine which reads off the <-chan tmpTblFile
+// goUploadTempTableFile is a goroutine which reads off the <-chan tmpTblFile
 // and uploads the read table file. We run multiple copies of it to get
 // upload parallelism on pushes.
 //
-// finalizeTableFiles is a goroutine which reads off the <-chan FilledWriters channel.
-// It finalizes a table file and adds the tmpTblFile to the upload channel. It
-// writes to shared state, fileIdToNumChunks, which will be used by Puller to
-// call destDB.AddTableFilesToManifest if everything completes successfully.
+// goFinalizeTableFiles is a goroutine which reads off the <-chan FilledWriters
+// channel.  It finalizes a table file and adds the tmpTblFile to the upload
+// channel. It writes to shared state, fileIdToNumChunks, which will be used by
+// Pull to call destDB.AddTableFilesToManifest if everything completes
+// successfully.
 //
-// cmpChunkWriter reads off the <-chan nbs.CompressedChunk. It writes the
-// incoming compressed chunk to a compressed chunk writer. When the compressed
-// chunk writer is large enough, it sends the table file as a FilledWriter down
-// the filled writers channel and starts a new table file.
+// goCmpChunkWriter reads off a <-chan nbs.CompressedChunk carrying chunks to
+// write to destDB. It writes the incoming compressed chunk to a compressed
+// chunk writer. When the compressed chunk writer is large enough, it sends the
+// table file as a FilledWriter down the filled writers channel and starts a
+// new table file.
 //
-// novelHashesFilter reads off a <-chan hash.HashSet which is sending
+// goNovelHashesFilter reads off a <-chan hash.HashSet which is sending
 // potentially novel chunk hashes we may want to fetch from srcDB, coming from
-// batchHashes. It filters the incoming addresses by a set of addresses it has
+// goBatchHashes. It filters the incoming addresses by a set of addresses it has
 // already downloaded. It calls HasMany on the destDB, collecting only novel
 // addresses which are not already present in the destDB and not already
 // downloaded. It adds those novel addresses to the downloaded set and then
 // forwards on the set of hashes which we actually want to fetch.
 //
-// getManyChunks reads off a <-chan hash.HashSet. It calls
-// srcDB.GetManyCompressed(..., hs) for each hash set it receives. It forwards
-// each compressed chunk it receives to cmpChunkWriter and to
-// chunkAddrsProcessor. We run multiple copies of getManyChunks to implement io
-// parallelism and attempt to paper over stragglers with regards to the
-// GetManyCompressed interface.
+// goGetManyChunks reads off a <-chan hash.HashSet. It calls
+// srcDB.GetManyCompressed(..., hs) for each HashSet it receives. It forwards
+// each compressed chunk it receives to goCmpChunkWriter and to
+// goChunkAddrsProcessor. We run multiple copies of goGetManyChunks to
+// implement io parallelism and attempt to paper over stragglers with regards
+// to the GetManyCompressed interface.
 //
-// chunkAddrsProcessor calls p.waf on each incoming chunk and forwards the
-// found addresses to novelHashesFilter. If p.waf is CPU bound (chunk decoding
-// or snappy decompression), we can run multiple copies of chunkAddrsProcessor.
+// goChunkAddrsProcessor walks the chunk addresses present in each incoming
+// chunk using p.waf. It forwards the found addresses to goNovelHashesFilter.
+// If p.waf is CPU bound (chunk decoding or snappy decompression), we can run
+// multiple copies of goChunkAddrsProcessor.
 //
-// batchHashes is middleware which connects chunkAddrsProcessor to
-// novelHashesFilter. It reads off the chunkAddrsProcessor channel and builds
-// up a batch of |maxBatchSize| to send to |novelHashesFilter|. In order to
-// avoid deadlocking, it must buffer arbitrary amounts of data, but it always
-// attempts to forward along the most recent batch it has built. This hueristic
-// allows for reasonable fanout while typically focusing on making progress at
-// lower levels of the tree when we have lots of addresses to walk.
+// goBatchHashes is middleware which connects goChunkAddrsProcessor to
+// goNovelHashesFilter. It reads off the channel carrying addreses from
+// goChunkAddrsProcessor and builds up a batch of |BatchSize| to send to
+// |goNovelHashesFilter|. In order to avoid deadlocking, it must buffer arbitrary
+// amounts of data, but it always attempts to forward along the most recent
+// complete batch it has built. This hueristic allows for reasonable fanout
+// while typically focusing on making progress at lower levels of the tree when
+// we have lots of addresses to walk.
 //
-// We rebatch again between novelHashesFilter and getManyChunks.
+// There is a loop between the channels:
+//
+//        +---------------------------------------------------------------------------+
+//        |                                                                           |
+//        V                                                                           |
+// goNovelHashesFilter -> goGetManyChunks -> goChunkAddrsProcessor -> goBatchHashes --+
+//
+// which makes finalization a bit awkward. Intuitively, the pipeline should
+// shutdown as soon as everything that |goNovelHashesFilter| ever output has been
+// processed and there it nothing more inflight. In order to accomplish this,
+// we use a WaitGroupCh abstraction. It looks a lot like a sync.WaitGroup, but
+// instead of |Wait()| has a |Done() <-chan struct{}| which is closed when the
+// count reaches 0. The maintained count is the count of batches existing
+// between |goBatchHashes| and |goNovelHashesFilter| plus the count of chunk
+// addresses in flight between |goNovelHashesFilter| and |goBatchHashes|. When
+// the count reaches 0 there are no in flight chunk addresses and no more
+// batches being built or sent. To main the count, |goNovelHashesFilter|
+// increases the inflightWg by |len(hs)| for every |HashSet| it sends to its
+// output.  |goBatchHashes| gets an incoming |HashSet| for every visited chunk
+// and it decreases the count by 1 for every |HashSet| it processes.
+// |goBatchHashes| also increases the count by 1 for every batch it creates. To
+// balance that, |goNovelHashesFilter| decreases the count by 1 for every batch
+// it receives from |goBatchHashes|.
 
 func (p *Puller) goUploadTempTableFile(ctx context.Context, files <-chan tempTblFile) error {
 	for {
@@ -375,7 +401,6 @@ func (p *Puller) goFinalizeTableFiles(ctx context.Context, fileIdToNumChunks map
 			return nil
 		case f, ok := <-fw:
 			if !ok {
-				close(files)
 				return nil
 			}
 			chunksLen := f.wr.ContentLength()
@@ -416,7 +441,6 @@ func (p *Puller) goCmpChunkWriter(ctx context.Context, chnks <-chan nbs.Compress
 					case fw <- FilledWriters{wr}:
 					}
 				}
-				close(fw)
 				return nil
 			}
 
@@ -447,9 +471,8 @@ func (p *Puller) goCmpChunkWriter(ctx context.Context, chnks <-chan nbs.Compress
 	}
 }
 
-func (p *Puller) goNovelHashesFilter(ctx context.Context, newAddrsCh <-chan hash.HashSet, toPullCh chan<- hash.HashSet, o outstanding) error {
+func (p *Puller) goNovelHashesFilter(ctx context.Context, newAddrsCh <-chan hash.HashSet, toPullCh chan<- hash.HashSet, inflight *WaitGroupCh) error {
 	downloaded := make(hash.HashSet)
-LOOP:
 	for {
 		select {
 		case <- ctx.Done():
@@ -465,7 +488,7 @@ LOOP:
 				return err
 			}
 			if len(newAddrs) != 0 {
-				o.Add(int32(len(newAddrs)))
+				inflight.Add(int32(len(newAddrs)))
 				downloaded.InsertAll(newAddrs)
 				select {
 				case <-ctx.Done():
@@ -473,51 +496,40 @@ LOOP:
 				case toPullCh <- newAddrs:
 				}
 			}
-			o.Add(-1)
-		case <-o.Ch:
-			close(toPullCh)
-			break LOOP
+			inflight.Add(-1)
+		case <-inflight.Done():
+			return nil
 		}
 	}
-	_, ok := <- newAddrsCh
-	if ok {
-		panic("bug in puller finalization; newAddrs was not closed after toPullCh was.")
-	}
-	return nil
 }
 
-type outstanding struct {
-	Cnt *int32
-	Ch  chan struct{}
+type WaitGroupCh struct {
+	cnt  int32
+	done chan struct{}
 }
 
-func (o outstanding) Add(i int32) {
-	c := atomic.AddInt32(o.Cnt, i)
+func (w *WaitGroupCh) Add(i int32) {
+	c := atomic.AddInt32(&w.cnt, i)
 	if c == 0 {
-		close(o.Ch)
+		close(w.done)
 	}
 }
 
-type multiSenderCh[T any] struct {
-	Cnt int32
-	Ch  chan<- T
+func (w *WaitGroupCh) Done() <-chan struct{} {
+	return w.done
 }
 
-func (c *multiSenderCh[T]) Close() {
-	if atomic.AddInt32(&c.Cnt, -1) == 0 {
-		close(c.Ch)
-	}
+func newWaitGroupCh(i int32) *WaitGroupCh {
+	return &WaitGroupCh{int32(i), make(chan struct{})}
 }
 
-func (p *Puller) goGetManyChunks(ctx context.Context, addrs <-chan hash.HashSet, toWriter *multiSenderCh[nbs.CompressedChunk], toWalker *multiSenderCh[nbs.CompressedChunk]) error {
+func (p *Puller) goGetManyChunks(ctx context.Context, addrs <-chan hash.HashSet, toWriter chan<- nbs.CompressedChunk, toWalker chan<- nbs.CompressedChunk) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case addrSet, ok := <-addrs:
 			if !ok {
-				toWriter.Close()
-				toWalker.Close()
 				return nil
 			}
 			seen := int32(0)
@@ -526,11 +538,11 @@ func (p *Puller) goGetManyChunks(ctx context.Context, addrs <-chan hash.HashSet,
 				atomic.AddUint64(&p.stats.fetchedSourceChunks, uint64(1))
 				atomic.AddInt32(&seen, 1)
 				select {
-				case toWriter.Ch <- c:
+				case toWriter <- c:
 				case <-ctx.Done():
 				}
 				select {
-				case toWalker.Ch <- c:
+				case toWalker <- c:
 				case <-ctx.Done():
 				}
 			})
@@ -546,60 +558,43 @@ func (p *Puller) goGetManyChunks(ctx context.Context, addrs <-chan hash.HashSet,
 
 const BatchSize = 64 * 1024
 
-type Addable interface {
-	Add(int32)
-}
-
-type noopAddable struct {
-}
-
-func (noopAddable) Add(int32) {
-}
-
-func (p *Puller) goBatchHashes(ctx context.Context, in <-chan hash.HashSet, out *multiSenderCh[hash.HashSet], o outstanding) error {
+func (p *Puller) goBatchHashes(ctx context.Context, in <-chan hash.HashSet, out chan<- hash.HashSet, inflight *WaitGroupCh) error {
 	batches := make([]hash.HashSet, 0)
-LOOP:
+	var cur hash.HashSet
 	for {
-		if len(batches) > 1 {
+		toSend := cur
+		if len(batches) > 0 {
+			toSend = batches[len(batches)-1]
+		}
+		if toSend != nil {
 			select {
 			case <-ctx.Done():
 				return nil
-			case out.Ch <- batches[len(batches)-2]:
-				batches[len(batches)-2] = batches[len(batches)-1]
-				batches = batches[:len(batches)-1]
+			case out <- toSend:
+				if len(batches) > 0 {
+					batches = batches[:len(batches)-1]
+				} else {
+					cur = nil
+				}
 			case addrs, ok := <- in:
 				if !ok {
-					break LOOP
+					panic("error in Puller finalization; goBatchHashes saw a closed addrs channel while it still had batches to send.")
 				}
 				if len(addrs) > 0 {
-					if len(batches[len(batches)-1]) + len(addrs) >= BatchSize {
-						o.Add(1)
-						batches = append(batches, addrs)
+					if cur == nil {
+						// We made a new batch; increase inflight count.
+						inflight.Add(1)
+						cur = addrs
 					} else {
-						batches[len(batches)-1].InsertAll(addrs)
+						cur.InsertAll(addrs)
+						if len(cur) >= BatchSize {
+							batches = append(batches, cur)
+							cur = nil
+						}
 					}
 				}
-				o.Add(-1)
-			}
-		} else if len(batches) == 1 {
-			select {
-			case <-ctx.Done():
-				return nil
-			case out.Ch <- batches[0]:
-				batches = batches[:0]
-			case addrs, ok := <- in:
-				if !ok {
-					break LOOP
-				}
-				if len(addrs) > 0 {
-					if len(batches[0]) + len(addrs) >= BatchSize {
-						o.Add(1)
-						batches = append(batches, addrs)
-					} else {
-						batches[0].InsertAll(addrs)
-					}
-				}
-				o.Add(-1)
+				// A chunk got fully processed; decrease inflight count.
+				inflight.Add(-1)
 			}
 		} else {
 			select {
@@ -607,35 +602,27 @@ LOOP:
 				return nil
 			case addrs, ok := <- in:
 				if !ok {
-					break LOOP
+					return nil
 				}
 				if len(addrs) > 0 {
-					o.Add(1)
-					batches = append(batches, addrs)
+					// We made a new batch; increase inflight count.
+					inflight.Add(1)
+					cur = addrs
 				}
-				o.Add(-1)
+				// A chunk got fully processed; decrease inflight count.
+				inflight.Add(-1)
 			}
 		}
 	}
-	for i := range batches {
-		select {
-		case <-ctx.Done():
-			return nil
-		case out.Ch <- batches[i]:
-		}
-	}
-	out.Close()
-	return nil
 }
 
-func (p *Puller) goChunkAddrsProcessor(ctx context.Context, chnks <-chan nbs.CompressedChunk, addrs *multiSenderCh[hash.HashSet]) error {
+func (p *Puller) goChunkAddrsProcessor(ctx context.Context, chnks <-chan nbs.CompressedChunk, addrs chan<- hash.HashSet) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case cmpChnk, ok := <-chnks:
 			if !ok {
-				addrs.Close()
 				return nil
 			}
 			chnk, err := cmpChnk.ToChunk()
@@ -654,7 +641,7 @@ func (p *Puller) goChunkAddrsProcessor(ctx context.Context, chnks <-chan nbs.Com
 			select {
 			case <-ctx.Done():
 				return nil
-			case addrs.Ch <- refs:
+			case addrs <- refs:
 			}
 		}
 	}
@@ -710,72 +697,70 @@ func (p *Puller) Pull(ctx context.Context) error {
 
 	// Our uploaders
 	toUploadCh := make(chan tempTblFile)
-	for i := 0; i < 3; i++ {
-		eg.Go(func() error {
-			return p.goUploadTempTableFile(ectx, toUploadCh)
-		})
-	}
+	eg.Go(func() error {
+		eg, ectx := errgroup.WithContext(ectx)
+		for i := 0; i < 3; i++ {
+			eg.Go(func() error {
+				return p.goUploadTempTableFile(ectx, toUploadCh)
+			})
+		}
+		return eg.Wait()
+	})
 
 	// Our finalizer
 	writersCh := make(chan FilledWriters)
 	eg.Go(func() error {
+		defer close(toUploadCh)
 		return p.goFinalizeTableFiles(ectx, fileIdToNumChunks, toUploadCh, writersCh)
 	})
 
 	// Our writer
 	toWriteCh := make(chan nbs.CompressedChunk)
-	toWriteChSend := &multiSenderCh[nbs.CompressedChunk]{
-		Cnt: numGetMany,
-		Ch:  toWriteCh,
-	}
 	eg.Go(func() error {
+		defer close(writersCh)
 		return p.goCmpChunkWriter(ectx, toWriteCh, writersCh)
 	})
 
 	walkedAddrsCh := make(chan hash.HashSet)
-	walkedAddrsChSend := &multiSenderCh[hash.HashSet]{
-		Cnt: numAddrWalkers,
-		Ch:  walkedAddrsCh,
-	}
 	toWalkCh := make(chan nbs.CompressedChunk)
-	toWalkChSend := &multiSenderCh[nbs.CompressedChunk]{
-		Cnt: numGetMany,
-		Ch:  toWalkCh,
-	}
 
 	// Our addr walkers
-	for i := 0; i < numAddrWalkers; i++ {
-		eg.Go(func() error {
-			return p.goChunkAddrsProcessor(ectx, toWalkCh, walkedAddrsChSend)
-		})
-	}
+	eg.Go(func() error {
+		defer close(walkedAddrsCh)
+		eg, ectx := errgroup.WithContext(ectx)
+		for i := 0; i < numAddrWalkers; i++ {
+			eg.Go(func() error {
+				return p.goChunkAddrsProcessor(ectx, toWalkCh, walkedAddrsCh)
+			})
+		}
+		return eg.Wait()
+	})
 
 	getManyCh := make(chan hash.HashSet)
-	for i := 0; i < numGetMany; i++ {
-		eg.Go(func() error {
-			return p.goGetManyChunks(ectx, getManyCh, toWriteChSend, toWalkChSend)
-		})
-	}
+	eg.Go(func() error {
+		defer close(toWriteCh)
+		defer close(toWalkCh)
+		eg, ectx := errgroup.WithContext(ectx)
+		for i := 0; i < numGetMany; i++ {
+			eg.Go(func() error {
+				return p.goGetManyChunks(ectx, getManyCh, toWriteCh, toWalkCh)
+			})
+		}
+		return eg.Wait()
+	})
 
-	outstandingChunks := outstanding{
-		Cnt: new(int32),
-		Ch:  make(chan struct{}),
-	}
+	inflight := newWaitGroupCh(1)
 	batchesCh := make(chan hash.HashSet, 1)
 	batchesCh <- hashes
-	*outstandingChunks.Cnt = 1
-	batchesChSend := &multiSenderCh[hash.HashSet]{
-		Cnt: 1,
-		Ch:  batchesCh,
-	}
 
-	// novel...
 	eg.Go(func() error {
-		return p.goNovelHashesFilter(ectx, batchesCh, getManyCh, outstandingChunks)
+		defer close(getManyCh)
+		return p.goNovelHashesFilter(ectx, batchesCh, getManyCh, inflight)
 	})
 
 	eg.Go(func() error {
-		return p.goBatchHashes(ectx, walkedAddrsCh, batchesChSend, outstandingChunks)
+		defer close(batchesCh)
+		return p.goBatchHashes(ectx, walkedAddrsCh, batchesCh, inflight)
 	})
 
 	err := eg.Wait()
