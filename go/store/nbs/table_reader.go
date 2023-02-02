@@ -27,7 +27,6 @@ import (
 	"errors"
 	"io"
 	"sort"
-	"sync/atomic"
 
 	"github.com/golang/snappy"
 	"golang.org/x/sync/errgroup"
@@ -36,8 +35,8 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
-// Do not read more than 128MB at a time.
-const maxReadSize = 128 * 1024 * 1024
+// Do not read more than 64MB at a time.
+const maxReadSize = 64 * 1024 * 1024
 
 // CompressedChunk represents a chunk of data in a table file which is still compressed via snappy.
 type CompressedChunk struct {
@@ -417,7 +416,7 @@ func (s readBatch) ExtractChunkFromRead(buff []byte, idx int) (CompressedChunk, 
 }
 
 func toReadBatches(offsets offsetRecSlice, blockSize uint64) []readBatch {
-	res := make([]readBatch, 0)
+	res := make([]readBatch, 0, len(offsets))
 	var batch readBatch
 	for i := 0; i < len(offsets); {
 		rec := offsets[i]
@@ -453,28 +452,18 @@ func (tr tableReader) getManyAtOffsetsWithReadFunc(
 		stats *Stats) error,
 ) error {
 	batches := toReadBatches(offsetRecords, tr.blockSize)
-	var idx int32
-	readBatches := func() error {
-		for {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			i := atomic.AddInt32(&idx, 1) - 1
-			if int(i) >= len(batches) {
-				return nil
-			}
-			rb := batches[i]
-			err := readAtOffsets(ctx, rb, stats)
+	if len(batches) == 0 {
+		return nil
+	}
+	eg.Go(func() error {
+		for _, b := range batches {
+			err := readAtOffsets(ctx, b, stats)
 			if err != nil {
 				return err
 			}
 		}
-	}
-	ioParallelism := 4
-	for i := 0; i < ioParallelism; i++ {
-		eg.Go(readBatches)
-	}
-
+		return nil
+	})
 	return nil
 }
 
@@ -487,7 +476,7 @@ func (tr tableReader) getManyAtOffsetsWithReadFunc(
 func (tr tableReader) findOffsets(reqs []getRecord) (ors offsetRecSlice, remaining bool, err error) {
 	filterIdx := uint32(0)
 	filterLen := uint32(len(tr.prefixes))
-	ors = make(offsetRecSlice, 0, len(reqs))
+	ors = make(offsetRecSlice, 0)
 
 	// Iterate over |reqs| and |tr.prefixes| (both sorted by address) and build the set
 	// of table locations which must be read in order to satisfy |reqs|.

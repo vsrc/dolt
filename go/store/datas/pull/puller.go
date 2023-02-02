@@ -304,6 +304,126 @@ func (s *stats) read() Stats {
 	return ret
 }
 
+// The puller is structured as a number of concurrent goroutines communicating
+// over channels.  They all run within the same errgroup and they all listen
+// for ctx.Done() on every channel send and receive.
+//
+// uploadTempTableFiles is a goroutine which reads off the <-chan tmpTblFile
+// and uploads the read table file. We run multiple copies of it to get
+// upload parallelism on pushes.
+//
+// finalizeTableFiles is a goroutine which reads off the <-chan FilledWriters channel.
+// It finalizes a table file and adds the tmpTblFile to the upload channel. It
+// writes to shared state, fileIdToNumChunks, which will be used by Puller to
+// call destDB.AddTableFilesToManifest if everything completes successfully.
+//
+// cmpChunkWriter reads off the <-chan nbs.CompressedChunk. It writes the
+// incoming compressed chunk to p.wr. If p.wr is large enough, it sends the
+// table file as a FilledWriter down the fille writers channel and starts a new
+// table file.
+//
+// novelHashesFilter reads off a <-chan hash.HashSet which is sending
+// potentially novel chunk hashes we may want to fetch from srcDB. It filters
+// the incoming addresses by a set of addresses it has already downloaded. It
+// calls HasMany on the destDB, collecting only novel addresses which are not
+// already present in the destDB and not already downloaded. It adds those
+// novel addresses to the downloaded set and then forwards on the set of hashes
+// which we actually want to fetch.
+//
+// getManyChunks reads off a <-chan hash.HashSet. It calls
+// srcDB.GetManyCompressed(..., hs) for each hash set it receives. It forwards
+// each compressed chunk it receives to cmpChunkWriter and to
+// chunkAddrsProcessor. We run multiple copies of getManyChunks to implement io
+// parallelism and attempt to paper over stragglers with regards to the
+// GetManyCompressed interface.
+//
+// chunkAddrsProcessor calls p.waf on each incoming chunk and forwards the
+// found addresses to novelHashesFilter. If p.waf is CPU bound (chunk decoding
+// or snappy decompression), we can run multiple copies of chunkAddrsProcessor.
+//
+// batchHashes is middleware which connects novelHashesFilter to the
+// getManyChunks goroutines. It reads off the novelHashesFilter channel and
+// builds up a batch of |maxBatchSize| to send to |getManyChunks|. If it has
+// already read too many hashes for a batch, it stops reading from the channel
+// and simply blocks on sending the batch to getManyChunks. Then it goes back
+// to building batches and optimistically sending the current batch to
+// getManyChunks.
+
+func (p *Puller) goUploadTempTableFile(ctx context.Context, files <-chan tempTblFile) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case f, ok := <-files:
+			if !ok {
+				return nil
+			}
+			err := p.uploadTempTableFile(ctx, f)
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (p *Puller) goFinalizeTableFiles(ctx context.Context, fileIdToNumChunks map[string]int, files chan<- tempTblFile, fw <-chan FilledWriters) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case f, ok := <-fw:
+			if !ok {
+				close(files)
+				return nil
+			}
+			chunksLen := tblFile.wr.ContentLength()
+			id, err := tblFile.wr.Finish()
+			if err != nil {
+				return err
+			}
+			ttf := tempTblFile{
+				id:          id,
+				read:        tblFile.wr,
+				numChunks:   tblFile.wr.ChunkCount(),
+				chunksLen:   chunksLen,
+				contentLen:  tblFile.wr.ContentLength(),
+				contentHash: tblFile.wr.GetMD5(),
+			}
+			fileIdToNumChunks[id] = ttf.numChunks
+			select {
+			case <-ctx.Done():
+				return nil
+			case files <- ttf:
+			}
+		}
+	}
+}
+
+func (p *Puller) goNovelHashesFilter(ctx context.Context, newAddrsCh <-chan hash.HashSet, toPullCh chan<- hash.HashSet) error {
+	numOutstanding := 1
+	var downloaded hash.HashSet
+	for {
+		select {
+		case <- ctx.Done():
+			return nil
+		case newAddrs := <- newAddrsCh:
+			newAddrs = limitToNewChunks(newAddrs, downloaded)
+			var err error
+			newAddrs, err = p.destDB.HasMany(ctx, newAddrs)
+			if err != nil {
+				return err
+			}
+			downloaded.InsertAll(newAddrs)
+			numOutstanding += len(newAddrs)
+			select {
+			case <-ctx.Done():
+				return nil
+			case toPullCh <- newAddrs:
+			}
+		}
+	}
+}
+
 func (p *Puller) uploadTempTableFile(ctx context.Context, tmpTblFile tempTblFile) error {
 	fileSize := tmpTblFile.contentLen
 	defer func() {
@@ -386,7 +506,6 @@ func (p *Puller) Pull(ctx context.Context) error {
 		defer c()
 	}
 
-	leaves := make(hash.HashSet)
 	absent := make(hash.HashSet)
 	absent.InsertAll(p.hashes)
 
@@ -410,7 +529,7 @@ func (p *Puller) Pull(ctx context.Context) error {
 
 			nextLeaves := make(hash.HashSet, numAbsent)
 			nextAbsent := make(hash.HashSet, numAbsent)
-			for i := range absentBatches {
+			for i := 0; i < len(absentBatches); i++ {
 				var err error
 				absentBatches[i], err = p.sinkDBCS.HasMany(ctx, absentBatches[i])
 				if err != nil {
@@ -418,14 +537,19 @@ func (p *Puller) Pull(ctx context.Context) error {
 				}
 
 				if len(absentBatches[i]) > 0 {
-					err = p.getCmp(ctx, leaves, nextLeaves, absentBatches[i], nextAbsent, completedTables)
+					err = p.getCmp(ctx, absentBatches[i], nextAbsent, completedTables)
 					if err != nil {
 						return err
+					}
+					if len(nextAbsent) >= 64 * 1024 {
+						newNumAbsent, newBatches := limitToNewChunks(nextAbsent, p.downloaded, 64*1024)
+						newBatches = append(newBatches, absentBatches[i+1:]...)
+						i = -1
+						nextAbsent = make(hash.HashSet)
 					}
 				}
 			}
 
-			leaves = nextLeaves
 			absent = nextAbsent
 		}
 
@@ -472,6 +596,7 @@ func limitToNewChunks(absent hash.HashSet, downloaded hash.HashSet, maxBatchSize
 		for k := range absent {
 			if !downloaded.Has(k) {
 				currentNewBatch.Insert(k)
+				downlaoded.Insert(k)
 				totalAbsent++
 
 				if totalAbsent%batchSize == 0 {
@@ -484,7 +609,7 @@ func limitToNewChunks(absent hash.HashSet, downloaded hash.HashSet, maxBatchSize
 	}
 }
 
-func (p *Puller) getCmp(ctx context.Context, leaves, nextLeaves, batch, nextLevel hash.HashSet, completedTables chan FilledWriters) error {
+func (p *Puller) getCmp(ctx context.Context, nextLevel hash.HashSet, completedTables chan FilledWriters) error {
 	found := make(chan nbs.CompressedChunk, 4096)
 	processed := make(chan CmpChnkAndRefs, 4096)
 
@@ -514,31 +639,22 @@ func (p *Puller) getCmp(ctx context.Context, leaves, nextLeaves, batch, nextLeve
 				if !ok {
 					break LOOP
 				}
-				p.downloaded.Insert(cmpChnk.H)
-				if leaves.Has(cmpChnk.H) {
-					select {
-					case processed <- CmpChnkAndRefs{cmpChnk: cmpChnk}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				} else {
-					chnk, err := cmpChnk.ToChunk()
-					if err != nil {
-						return err
-					}
-					refs := make(map[hash.Hash]bool)
-					err = p.waf(chnk, func(h hash.Hash, isleaf bool) error {
-						refs[h] = isleaf
-						return nil
-					})
-					if err != nil {
-						return err
-					}
-					select {
-					case processed <- CmpChnkAndRefs{cmpChnk: cmpChnk, refs: refs}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+				chnk, err := cmpChnk.ToChunk()
+				if err != nil {
+					return err
+				}
+				refs := make(map[hash.Hash]bool)
+				err = p.waf(chnk, func(h hash.Hash, isleaf bool) error {
+					refs[h] = isleaf
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+				select {
+				case processed <- CmpChnkAndRefs{cmpChnk: cmpChnk, refs: refs}:
+				case <-ctx.Done():
+					return ctx.Err()
 				}
 			case <-ctx.Done():
 				return ctx.Err()
@@ -586,9 +702,6 @@ func (p *Puller) getCmp(ctx context.Context, leaves, nextLeaves, batch, nextLeve
 
 				for h, isleaf := range cmpAndRef.refs {
 					nextLevel.Insert(h)
-					if isleaf {
-						nextLeaves.Insert(h)
-					}
 				}
 
 				cmpAndRef.cmpChnk.FullCompressedChunk = nil
@@ -603,9 +716,5 @@ func (p *Puller) getCmp(ctx context.Context, leaves, nextLeaves, batch, nextLeve
 		return nil
 	})
 
-	err := eg.Wait()
-	if err != nil {
-		return err
-	}
-	return nil
+	return eg.Wait()
 }

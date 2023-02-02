@@ -754,6 +754,8 @@ func (nbs *NomsBlockStore) getManyWithFunc(
 	}()
 
 	eg, ctx := errgroup.WithContext(ctx)
+	ioParallelism := 16
+	eg.SetLimit(ioParallelism)
 
 	tables, remaining, err := func() (tables chunkReader, remaining bool, err error) {
 		nbs.mu.RLock()
@@ -766,6 +768,7 @@ func (nbs *NomsBlockStore) getManyWithFunc(
 		return
 	}()
 	if err != nil {
+		eg.Wait()
 		return err
 	}
 
