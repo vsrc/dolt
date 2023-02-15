@@ -336,10 +336,9 @@ func writeJournalToTable(ctx context.Context, journal io.ReadSeeker, wr io.Write
 		}
 		spec.chunkCount++
 		prefixes = append(prefixes, prefixIndexRec{
-			prefix: r.address.Prefix(),
-			suffix: r.address.Suffix(),
-			order:  uint32(len(prefixes)),
-			size:   uint32(len(r.payload)),
+			addr:  r.address,
+			order: uint32(len(prefixes)),
+			size:  uint32(len(r.payload)),
 		})
 		uncompressed += r.uncompressedPayloadSize()
 		return

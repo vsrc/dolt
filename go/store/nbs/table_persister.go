@@ -64,12 +64,16 @@ type tableFilePersister interface {
 	tablePersister
 
 	// CopyTableFile copies the table file with the given fileId from the reader to the TableFileStore.
-	CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, chunkCount uint32) error
+	CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, fileSz uint64, chunkCount uint32) error
 
 	// Path returns the file system path. Use CopyTableFile instead of Path to
 	// copy a file to the TableFileStore. Path cannot be removed because it's used
 	// in remotesrv.
 	Path() string
+}
+
+type movingTableFilePersister interface {
+	TryMoveCmpChunkTableWriter(ctx context.Context, filename string, w *CmpChunkTableWriter) error
 }
 
 type chunkSourcesByDescendingDataSize struct {
@@ -174,7 +178,8 @@ func planConjoin(sources []sourceWithSize, stats *Stats) (plan compactionPlan, e
 
 		// Add all the prefix tuples from this index to the list of all prefixIndexRecs, modifying the ordinals such that all entries from the 1st item in sources come after those in the 0th and so on.
 		for j, prefix := range prefixes {
-			rec := prefixIndexRec{prefix: prefix, order: ordinalOffset + ordinals[j]}
+			rec := prefixIndexRec{order: ordinalOffset + ordinals[j]}
+			binary.BigEndian.PutUint64(rec.addr[:], prefix)
 			prefixIndexRecs = append(prefixIndexRecs, rec)
 		}
 
@@ -226,7 +231,7 @@ func planConjoin(sources []sourceWithSize, stats *Stats) (plan compactionPlan, e
 	sort.Sort(prefixIndexRecs)
 	var pfxPos uint64
 	for _, pi := range prefixIndexRecs {
-		binary.BigEndian.PutUint64(plan.mergedIndex[pfxPos:], pi.prefix)
+		binary.BigEndian.PutUint64(plan.mergedIndex[pfxPos:], pi.addr.Prefix())
 		pfxPos += addrPrefixSize
 		binary.BigEndian.PutUint32(plan.mergedIndex[pfxPos:], pi.order)
 		pfxPos += ordinalSize

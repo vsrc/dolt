@@ -78,7 +78,7 @@ func (ftp *fsTablePersister) Path() string {
 	return ftp.dir
 }
 
-func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, chunkCount uint32) error {
+func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, fileSz uint64, chunkCount uint32) error {
 	tn, err := func() (n string, err error) {
 		defer func() {
 			cerr := r.Close()
@@ -113,6 +113,11 @@ func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.ReadCloser,
 
 	path := filepath.Join(ftp.dir, fileId)
 	return file.Rename(tn, path)
+}
+
+func (ftp *fsTablePersister) TryMoveCmpChunkTableWriter(ctx context.Context, filename string, w *CmpChunkTableWriter) error {
+	path := filepath.Join(ftp.dir, filename)
+	return w.FlushToFile(path)
 }
 
 func (ftp *fsTablePersister) persistTable(ctx context.Context, name addr, data []byte, chunkCount uint32, stats *Stats) (cs chunkSource, err error) {

@@ -216,6 +216,10 @@ func (m Map) NodeStore() tree.NodeStore {
 	return m.tuples.NodeStore
 }
 
+func (m Map) Tuples() tree.StaticMap[val.Tuple, val.Tuple, val.TupleDesc] {
+	return m.tuples
+}
+
 // Mutate makes a MutableMap from a Map.
 func (m Map) Mutate() *MutableMap {
 	return newMutableMap(m)
@@ -264,8 +268,8 @@ func (m Map) Has(ctx context.Context, key val.Tuple) (ok bool, err error) {
 	return m.tuples.Has(ctx, key)
 }
 
-func (m Map) Last(ctx context.Context) (key, value val.Tuple, err error) {
-	return m.tuples.Last(ctx)
+func (m Map) LastKey(ctx context.Context) val.Tuple {
+	return m.tuples.LastKey(ctx)
 }
 
 // IterAll returns a MapIter that iterates over the entire Map.

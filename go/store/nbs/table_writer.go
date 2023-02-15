@@ -38,7 +38,7 @@ type tableWriter struct {
 	pos                   uint64
 	totalCompressedData   uint64
 	totalUncompressedData uint64
-	prefixes              prefixIndexSlice // TODO: This is in danger of exploding memory
+	prefixes              prefixIndexSlice
 
 	snapper snappyEncoder
 }
@@ -111,8 +111,7 @@ func (tw *tableWriter) addChunk(h addr, data []byte) bool {
 
 	// Stored in insertion order
 	tw.prefixes = append(tw.prefixes, prefixIndexRec{
-		h.Prefix(),
-		h.Suffix(),
+		h,
 		uint32(len(tw.prefixes)),
 		uint32(checksumSize + dataLength),
 	})
@@ -132,15 +131,14 @@ func (tw *tableWriter) finish() (uncompressedLength uint64, blockAddr addr, err 
 }
 
 type prefixIndexRec struct {
-	prefix      uint64
-	suffix      [12]byte
+	addr        addr
 	order, size uint32
 }
 
 type prefixIndexSlice []prefixIndexRec
 
 func (hs prefixIndexSlice) Len() int           { return len(hs) }
-func (hs prefixIndexSlice) Less(i, j int) bool { return hs[i].prefix < hs[j].prefix }
+func (hs prefixIndexSlice) Less(i, j int) bool { return hs[i].addr.Prefix() < hs[j].addr.Prefix() }
 func (hs prefixIndexSlice) Swap(i, j int)      { hs[i], hs[j] = hs[j], hs[i] }
 
 func (tw *tableWriter) writeIndex() (addr, error) {
@@ -170,7 +168,7 @@ func writeChunkIndex(buf []byte, prefixes prefixIndexSlice) (n uint64, a addr, e
 	var off uint64
 	for _, pi := range prefixes {
 		// addr prefix
-		binary.BigEndian.PutUint64(buf[off:], pi.prefix)
+		binary.BigEndian.PutUint64(buf[off:], pi.addr.Prefix())
 		off += addrPrefixSize
 
 		// order
@@ -183,7 +181,7 @@ func writeChunkIndex(buf []byte, prefixes prefixIndexSlice) (n uint64, a addr, e
 
 		// hash suffix
 		o = suffixesOff + uint64(pi.order)*addrSuffixSize
-		copy(buf[o:], pi.suffix[:])
+		copy(buf[o:], pi.addr.Suffix()[:])
 	}
 
 	// hash the suffixes for the table name
