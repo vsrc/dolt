@@ -74,19 +74,25 @@ type repoRequest interface {
 	GetRepoPath() string
 }
 
-func getRepoPath(req repoRequest) string {
+func getRepoPath(req repoRequest) (string, error) {
 	if req.GetRepoPath() != "" {
-		return req.GetRepoPath()
+		return req.GetRepoPath(), nil
 	}
-	if req.GetRepoId() != nil {
-		return req.GetRepoId().Org + "/" + req.GetRepoId().RepoName
+	if repoId := req.GetRepoId(); repoId != nil {
+		if repoId.Org == "" || repoId.RepoName == "" {
+			return "", status.Error(codes.InvalidArgument, "expected repo_id.org and repo_id.repo_name, missing at least one")
+		}
+		return req.GetRepoId().Org + "/" + req.GetRepoId().RepoName, nil
 	}
-	return ""
+	return "", status.Error(codes.InvalidArgument, "expected repo_path or repo_id, got neither")
 }
 
 func (rs *RemoteChunkStore) HasChunks(ctx context.Context, req *remotesapi.HasChunksRequest) (*remotesapi.HasChunksResponse, error) {
 	logger := getReqLogger(rs.lgr, "HasChunks")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -95,7 +101,10 @@ func (rs *RemoteChunkStore) HasChunks(ctx context.Context, req *remotesapi.HasCh
 		return nil, err
 	}
 
-	hashes, hashToIndex := remotestorage.ParseByteSlices(req.Hashes)
+	hashes, hashToIndex, err := remotestorage.ParseByteSlices(req.Hashes)
+	if err != nil {
+		return nil, err
+	}
 
 	absent, err := cs.HasMany(ctx, hashes)
 	if err != nil {
@@ -141,7 +150,10 @@ func (rs *RemoteChunkStore) getRelativeStorePath(cs RemoteSrvStore) (string, err
 
 func (rs *RemoteChunkStore) GetDownloadLocations(ctx context.Context, req *remotesapi.GetDownloadLocsRequest) (*remotesapi.GetDownloadLocsResponse, error) {
 	logger := getReqLogger(rs.lgr, "GetDownloadLocations")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -150,7 +162,10 @@ func (rs *RemoteChunkStore) GetDownloadLocations(ctx context.Context, req *remot
 		return nil, err
 	}
 
-	hashes, _ := remotestorage.ParseByteSlices(req.ChunkHashes)
+	hashes, _, err := remotestorage.ParseByteSlices(req.ChunkHashes)
+	if err != nil {
+		return nil, err
+	}
 
 	prefix, err := rs.getRelativeStorePath(cs)
 	if err != nil {
@@ -241,7 +256,10 @@ func (rs *RemoteChunkStore) StreamDownloadLocations(stream remotesapi.ChunkStore
 
 		numMessages += 1
 
-		nextPath := getRepoPath(req)
+		nextPath, err := getRepoPath(req)
+		if err != nil {
+			return err
+		}
 		if nextPath != repoPath {
 			repoPath = nextPath
 			logger = ologger.WithField(RepoPathField, repoPath)
@@ -256,7 +274,10 @@ func (rs *RemoteChunkStore) StreamDownloadLocations(stream remotesapi.ChunkStore
 			}
 		}
 
-		hashes, _ := remotestorage.ParseByteSlices(req.ChunkHashes)
+		hashes, _, err := remotestorage.ParseByteSlices(req.ChunkHashes)
+		if err != nil {
+			return err
+		}
 		numHashes += len(hashes)
 		locations, err := cs.GetChunkLocationsWithPaths(hashes)
 		if err != nil {
@@ -327,11 +348,14 @@ func (rs *RemoteChunkStore) getDownloadUrl(md metadata.MD, path string) *url.URL
 	}
 }
 
-func parseTableFileDetails(req *remotesapi.GetUploadLocsRequest) []*remotesapi.TableFileDetails {
+func parseTableFileDetails(req *remotesapi.GetUploadLocsRequest) ([]*remotesapi.TableFileDetails, error) {
 	tfd := req.GetTableFileDetails()
 
 	if len(tfd) == 0 {
-		_, hashToIdx := remotestorage.ParseByteSlices(req.TableFileHashes)
+		_, hashToIdx, err := remotestorage.ParseByteSlices(req.TableFileHashes)
+		if err != nil {
+			return nil, err
+		}
 
 		tfd = make([]*remotesapi.TableFileDetails, len(hashToIdx))
 		for h, i := range hashToIdx {
@@ -343,21 +367,27 @@ func parseTableFileDetails(req *remotesapi.GetUploadLocsRequest) []*remotesapi.T
 		}
 	}
 
-	return tfd
+	return tfd, nil
 }
 
 func (rs *RemoteChunkStore) GetUploadLocations(ctx context.Context, req *remotesapi.GetUploadLocsRequest) (*remotesapi.GetUploadLocsResponse, error) {
 	logger := getReqLogger(rs.lgr, "GetUploadLocations")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
-	_, err := rs.getStore(logger, repoPath)
+	_, err = rs.getStore(logger, repoPath)
 	if err != nil {
 		return nil, err
 	}
 
-	tfds := parseTableFileDetails(req)
+	tfds, err := parseTableFileDetails(req)
+	if err != nil {
+		return nil, err
+	}
 
 	md, _ := metadata.FromIncomingContext(ctx)
 
@@ -403,11 +433,14 @@ func (rs *RemoteChunkStore) getUploadUrl(md metadata.MD, repoPath string, tfd *r
 
 func (rs *RemoteChunkStore) Rebase(ctx context.Context, req *remotesapi.RebaseRequest) (*remotesapi.RebaseResponse, error) {
 	logger := getReqLogger(rs.lgr, "Rebase")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
-	_, err := rs.getStore(logger, repoPath)
+	_, err = rs.getStore(logger, repoPath)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +450,10 @@ func (rs *RemoteChunkStore) Rebase(ctx context.Context, req *remotesapi.RebaseRe
 
 func (rs *RemoteChunkStore) Root(ctx context.Context, req *remotesapi.RootRequest) (*remotesapi.RootResponse, error) {
 	logger := getReqLogger(rs.lgr, "Root")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -437,7 +473,10 @@ func (rs *RemoteChunkStore) Root(ctx context.Context, req *remotesapi.RootReques
 
 func (rs *RemoteChunkStore) Commit(ctx context.Context, req *remotesapi.CommitRequest) (*remotesapi.CommitResponse, error) {
 	logger := getReqLogger(rs.lgr, "Commit")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -446,9 +485,18 @@ func (rs *RemoteChunkStore) Commit(ctx context.Context, req *remotesapi.CommitRe
 		return nil, err
 	}
 
-	//should validate
+	if len(req.Current) != hash.ByteLen {
+		return nil, status.Errorf(codes.InvalidArgument, "commit request current hash expected length of %d, was %d", hash.ByteLen, len(req.Current))
+	}
+	if len(req.Last) != hash.ByteLen {
+		return nil, status.Errorf(codes.InvalidArgument, "commit request last hash expected length of %d, was %d", hash.ByteLen, len(req.Last))
+	}
+
 	updates := make(map[string]int)
 	for _, cti := range req.ChunkTableInfo {
+		if len(cti.Hash) != hash.ByteLen {
+			return nil, status.Errorf(codes.InvalidArgument, "chunk table info hash expected length of %d, was %d", hash.ByteLen, len(cti.Hash))
+		}
 		updates[hash.New(cti.Hash).String()] = int(cti.ChunkCount)
 	}
 
@@ -477,9 +525,22 @@ func (rs *RemoteChunkStore) Commit(ctx context.Context, req *remotesapi.CommitRe
 
 func (rs *RemoteChunkStore) GetRepoMetadata(ctx context.Context, req *remotesapi.GetRepoMetadataRequest) (*remotesapi.GetRepoMetadataResponse, error) {
 	logger := getReqLogger(rs.lgr, "GetRepoMetadata")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
+
+	if req.ClientRepoFormat == nil {
+		return nil, status.Error(codes.InvalidArgument, "get repo metadata request requires ClientRepoFormat")
+	}
+	if req.ClientRepoFormat.NbfVersion == "" {
+		return nil, status.Error(codes.InvalidArgument, "get repo metadata request requires an nbf version")
+	}
+	if req.ClientRepoFormat.NbsVersion == "" {
+		return nil, status.Error(codes.InvalidArgument, "get repo metadata request requires an nbs version")
+	}
 
 	cs, err := rs.getOrCreateStore(logger, repoPath, req.ClientRepoFormat.NbfVersion)
 	if err != nil {
@@ -501,7 +562,10 @@ func (rs *RemoteChunkStore) GetRepoMetadata(ctx context.Context, req *remotesapi
 
 func (rs *RemoteChunkStore) ListTableFiles(ctx context.Context, req *remotesapi.ListTableFilesRequest) (*remotesapi.ListTableFilesResponse, error) {
 	logger := getReqLogger(rs.lgr, "ListTableFiles")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -576,7 +640,10 @@ func getTableFileInfo(
 // AddTableFiles updates the remote manifest with new table files without modifying the root hash.
 func (rs *RemoteChunkStore) AddTableFiles(ctx context.Context, req *remotesapi.AddTableFilesRequest) (*remotesapi.AddTableFilesResponse, error) {
 	logger := getReqLogger(rs.lgr, "AddTableFiles")
-	repoPath := getRepoPath(req)
+	repoPath, err := getRepoPath(req)
+	if err != nil {
+		return nil, err
+	}
 	logger = logger.WithField(RepoPathField, repoPath)
 	defer func() { logger.Info("finished") }()
 
@@ -585,9 +652,11 @@ func (rs *RemoteChunkStore) AddTableFiles(ctx context.Context, req *remotesapi.A
 		return nil, err
 	}
 
-	// should validate
 	updates := make(map[string]int)
 	for _, cti := range req.ChunkTableInfo {
+		if len(cti.Hash) != hash.ByteLen {
+			return nil, status.Errorf(codes.InvalidArgument, "chunk table info hash expected length of %d, was %d", hash.ByteLen, len(cti.Hash))
+		}
 		updates[hash.New(cti.Hash).String()] = int(cti.ChunkCount)
 	}
 

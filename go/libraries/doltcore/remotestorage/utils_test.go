@@ -180,7 +180,7 @@ func TestParseByteSlices(t *testing.T) {
 	}{
 		{
 			"test nil",
-			[][]byte{},
+			[][]byte(nil),
 		},
 		{
 			"test empty",
@@ -198,7 +198,7 @@ func TestParseByteSlices(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			hashes, hashToIndex := ParseByteSlices(test.bytes)
+			hashes, hashToIndex, _ := ParseByteSlices(test.bytes)
 
 			if len(hashes) != len(test.bytes) {
 				t.Error("unexpected size")
@@ -214,4 +214,9 @@ func TestParseByteSlices(t *testing.T) {
 		})
 	}
 
+	randomHashBytes[3] = append(randomHashBytes[3], randomHashBytes[3]...)
+	_, _, err := ParseByteSlices(randomHashBytes)
+	if err == nil {
+		t.Error("expected error, did not get one")
+	}
 }

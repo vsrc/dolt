@@ -14,7 +14,12 @@
 
 package remotestorage
 
-import "github.com/dolthub/dolt/go/store/hash"
+import (
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/codes"
+
+	"github.com/dolthub/dolt/go/store/hash"
+)
 
 // HashesToSlices takes a list of hashes and converts each hash to a byte slice returning a slice of byte slices
 func HashesToSlices(hashes []hash.Hash) [][]byte {
@@ -46,15 +51,18 @@ func HashSetToSlices(hashes hash.HashSet) ([]hash.Hash, [][]byte) {
 
 // ParseByteSlices takes a slice of byte slices and converts it to a HashSet, and a map from hash to it's index in the
 // original slice
-func ParseByteSlices(byteSlices [][]byte) (hash.HashSet, map[hash.Hash]int) {
+func ParseByteSlices(byteSlices [][]byte) (hash.HashSet, map[hash.Hash]int, error) {
 	hs := make(hash.HashSet)
 	hashToIndex := make(map[hash.Hash]int)
 
 	for i, byteSl := range byteSlices {
+		if len(byteSl) != hash.ByteLen {
+			return nil, nil, status.Errorf(codes.InvalidArgument, "invalid hash provided, expected %d bytes, got %d", hash.ByteLen, len(byteSl))
+		}
 		h := hash.New(byteSl)
 		hs[h] = struct{}{}
 		hashToIndex[h] = i
 	}
 
-	return hs, hashToIndex
+	return hs, hashToIndex, nil
 }
