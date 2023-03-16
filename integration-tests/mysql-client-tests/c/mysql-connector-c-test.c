@@ -58,6 +58,8 @@ void BeginForeignScan(MYSQL* conn, festate* state) {
     }
     fprintf(stderr, "mysql query prepared successfully\n");
 
+    //
+
     // TODO: Prepare for output conversion of parameters used in remote query
     // TODO: Set the statement as cursor type
     // TODO: Set the pre-fetch rows
@@ -82,17 +84,11 @@ void IterateForeignScan(MYSQL* conn, festate* state) {
     }
     fprintf(stderr, "mysql query executed successfully\n");
 
-    if (mysql_stmt_execute(state->stmt)) {
-            fprintf(stderr, "failed to execute the mysql query: \n%s", mysql_error(conn));
-            exit(1);
-        }
-        fprintf(stderr, "mysql query executed successfully\n");
-
-    if (mysql_stmt_store_result(state->stmt) != 0) {
-        fprintf(stderr, "failed to store the result: \n%s", mysql_error(conn));
-        exit(1);
-    }
-    fprintf(stderr, "results stored successfully\n");
+//    if (mysql_stmt_store_result(state->stmt) != 0) {
+//        fprintf(stderr, "failed to store the result: \n%s", mysql_error(conn));
+//        exit(1);
+//    }
+//    fprintf(stderr, "results stored successfully\n");
 
     // Bind the results pointers for the prepare statements
     if (mysql_stmt_bind_result(state->stmt, state->mysql_bind)) {
@@ -115,6 +111,13 @@ void IterateForeignScan(MYSQL* conn, festate* state) {
         exit(1);
     }
 
+    // set sql_mode
+    if (mysql_query(conn, "SET sql_mode = 'ANSI_QUOTES'")) {
+        fprintf(stderr, "failed to set sql_mode: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "sql_mode set successfully\n");
+
     fprintf(stderr, "results fetched successfully\n");
 }
 
@@ -129,7 +132,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    if (mysql_real_connect(conn, "127.0.0.1", user, "", db, port, NULL, 0) == NULL) {
+    if (mysql_real_connect(conn, "127.0.0.1", user, "root", db, port, NULL, 0) == NULL) {
         fprintf(stderr, "%s\n", mysql_error(conn));
         mysql_close(conn);
         exit(1);
@@ -137,7 +140,7 @@ int main(int argc, char **argv) {
 
     int pk = 1;
     festate state = {
-        .query = "SELECT `i` from `tmp`.`t`",
+        .query = "SELECT `i` from `test_db`.`t`",
         .mysql_bind = {
             [0] = {
                 .buffer_type = MYSQL_TYPE_LONG,
