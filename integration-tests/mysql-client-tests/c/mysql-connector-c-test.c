@@ -23,171 +23,138 @@ char *queries[QUERIES_SIZE] =
    "select COUNT(*) FROM dolt_log",
   };
 
-typedef struct statement_t {
+typedef struct festate_t {
   char *query;
-  MYSQL_BIND bind[10];
-  int expect_prepare_error;
-  int expect_exec_error;
-  int expect_result_metadata;
-} statement;
+  MYSQL_STMT* stmt;
+  MYSQL_BIND mysql_bind[10];
+} festate;
 
-void test_statement(MYSQL *con, statement *stmt) {
-  MYSQL_STMT *mstmt = mysql_stmt_init(con);
-  if (!mstmt) {
-    fprintf(stderr, "failed to init stmt: %s\n", mysql_error(con));
-    exit(1);
-  }
-  if ( mysql_stmt_prepare(mstmt, stmt->query, strlen(stmt->query)) ) {
-    if ( !stmt->expect_prepare_error) {
-      fprintf(stderr, "failed to prepare stmt: %s: %s\n", stmt->query, mysql_stmt_error(mstmt));
-      exit(1);
-    } else {
-      goto close;
-    }
-  }
-  if ( mysql_stmt_bind_param(mstmt, stmt->bind) ) {
-    fprintf(stderr, "failed to bind stmt: %s: %s\n", stmt->query, mysql_stmt_error(mstmt));
-    exit(1);
-  }
-  MYSQL_RES *metadata = mysql_stmt_result_metadata(mstmt);
-  if (stmt->expect_result_metadata && metadata == NULL) {
-    fprintf(stderr, "result metadata was unexpectedly NULL: %s\n", stmt->query);
-    exit(1);
-  } else if (!stmt->expect_result_metadata && metadata != NULL) {
-    fprintf(stderr, "result metadata was unexpectedly non-NULL: %s\n", stmt->query);
-    exit(1);
-  }
-  if ( mysql_stmt_execute(mstmt) ) {
-    if ( !stmt->expect_exec_error) {
-      fprintf(stderr, "failed to execute stmt: %s: %s\n", stmt->query, mysql_stmt_error(mstmt));
-      exit(1);
-    }
-  }
-  // TODO: Add test for mysql_stmt_store_result when supported
-close:
-  if ( mysql_stmt_close(mstmt) ) {
-    fprintf(stderr, "failed to close stmt: %s: %s\n", stmt->query, mysql_error(con));
-    exit(1);
-  }
+void GetForeignRelSize() {
+
 }
 
-statement LAST_STATEMENT = {
-};
+void BeginForeignScan(MYSQL* conn, festate* state) {
+    fprintf(stderr, "===BEGIN FOREIGN SCAN===\n");
 
-int main(int argc, char **argv) { 
-
-  char* user = argv[1];
-  int   port = atoi(argv[2]);
-  char* db   = argv[3];
-  
-  MYSQL *con = mysql_init(NULL);
-
-  if ( con == NULL ) {
-      fprintf(stderr, "%s\n", mysql_error(con));
-      exit(1);
-  }
-
-  if ( mysql_real_connect(con,
-			 "127.0.0.1",
-			 user,
-			 "",
-			 db,
-			 port,
-			 NULL,
-			 0 ) == NULL) {
-    fprintf(stderr, "%s\n", mysql_error(con));
-    mysql_close(con);
-    exit(1);
-  }
-
-  for ( int i = 0; i < QUERIES_SIZE; i++ ) {
-    if ( mysql_query(con, queries[i]) ) {
-      printf("QUERY FAILED: %s\n", queries[i]);
-      fprintf(stderr, "%s\n", mysql_error(con));
-      mysql_close(con);
-      exit(1);
-    } else {
-      // Not checking validity of results for now
-      MYSQL_RES* result = mysql_use_result(con);
-      mysql_free_result(result);
+    // set sql_mode
+    if (mysql_query(conn, "SET sql_mode = 'ANSI_QUOTES'")) {
+        fprintf(stderr, "failed to set sql_mode: \n%s", mysql_error(conn));
+        exit(1);
     }
-  }
+    fprintf(stderr, "sql_mode set successfully\n");
 
-  int pk = 1;
-  int value = 12;
-  unsigned long string_len = 16;
-  statement statements[] = {
-    {
-      .query = "select * from test where pk = ?",
-      .bind = {
-        [0] = {
-         .buffer_type = MYSQL_TYPE_LONG,
-         .buffer = (void *)(&pk),
-         .buffer_length = sizeof(pk),
-        },
-      },
-      .expect_result_metadata = 1,
-    },
-    {
-      .query = "select * from test where pk = ?",
-      .bind = {
-        [0] = {
-         .buffer_type = MYSQL_TYPE_LONG,
-         .buffer = (void *)(&pk),
-         .buffer_length = sizeof(pk),
-         .is_unsigned = 1,
-        },
-      },
-      .expect_result_metadata = 1,
-    },
-    {
-      .query = "insert into test values (?, ?)",
-      .bind = {
-        [0] = {
-         .buffer_type = MYSQL_TYPE_LONG,
-         .buffer = (void *)(&pk),
-         .buffer_length = sizeof(pk),
-        },
-        [1] = {
-         .buffer_type = MYSQL_TYPE_LONG,
-         .buffer = (void *)(&value),
-         .buffer_length = sizeof(value),
-        },
-      },
-      .expect_result_metadata = 0,
-    },
-    {
-      .query = "update test set `value` = ?",
-      .bind = {
-        [0] = {
-         .buffer_type = MYSQL_TYPE_STRING,
-         .buffer = (void *)"test string here",
-         .buffer_length = string_len,
-         .length = &string_len,
-        },
-      },
-      .expect_exec_error = 1,
-      .expect_result_metadata = 0,
-    },
-    {
-      .query = "select * from test SYNTAX ERROR where pk = ?",
-      .bind = {
-        [0] = {
-         .buffer_type = MYSQL_TYPE_LONG,
-         .buffer = (void *)(&pk),
-         .buffer_length = sizeof(pk),
-        },
-      },
-      .expect_prepare_error = 1,
-    },
-    LAST_STATEMENT,
-  };
+    // initialize mysql statement
+    state->stmt = mysql_stmt_init(conn);
+    if (!state->stmt) {
+        fprintf(stderr, "failed to initialize the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "mysql query initialized successfully\n");
 
-  for (int i = 0; statements[i].query; i++) {
-    test_statement(con, &statements[i]);
-  }
+    // prepare the mysql statement
+    if (mysql_stmt_prepare(state->stmt, state->query, strlen(state->query))) {
+        fprintf(stderr, "failed to prepare the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "mysql query prepared successfully\n");
 
-  mysql_close(con);
-  
-  return 0;
+    // TODO: Prepare for output conversion of parameters used in remote query
+    // TODO: Set the statement as cursor type
+    // TODO: Set the pre-fetch rows
+    // TODO: Set STMT_ATTR_UPDATE_MAX_LENGTH so that mysql_stmt_store_result() can update metadata MYSQL_FIELD->max_length value
+
+    // Bind the results pointers for the prepare statements
+    if (mysql_stmt_bind_result(state->stmt, state->mysql_bind)) {
+        fprintf(stderr, "failed to bind the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "mysql query bound successfully\n");
+}
+
+void IterateForeignScan(MYSQL* conn, festate* state) {
+    fprintf(stderr, "===ITERATE FOREIGN SCAN===\n");
+    // TODO: assume this is the first call
+    // TODO: if num params > 0, mysql_stmt_bind_param
+
+    if (mysql_stmt_execute(state->stmt)) {
+        fprintf(stderr, "failed to execute the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "mysql query executed successfully\n");
+
+    if (mysql_stmt_execute(state->stmt)) {
+            fprintf(stderr, "failed to execute the mysql query: \n%s", mysql_error(conn));
+            exit(1);
+        }
+        fprintf(stderr, "mysql query executed successfully\n");
+
+    if (mysql_stmt_store_result(state->stmt) != 0) {
+        fprintf(stderr, "failed to store the result: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "results stored successfully\n");
+
+    // Bind the results pointers for the prepare statements
+    if (mysql_stmt_bind_result(state->stmt, state->mysql_bind)) {
+        fprintf(stderr, "failed to bind the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "results bound successfully\n");
+
+    int rc = mysql_stmt_fetch(state->stmt);
+    if (rc == 1) {
+        fprintf(stderr, "failed to fetch the mysql query: \n%s", mysql_error(conn));
+        exit(1);
+    }
+    if (rc == MYSQL_NO_DATA) {
+        fprintf(stderr, "fetched empty result set\n");
+        exit(1);
+    }
+    if (rc == MYSQL_DATA_TRUNCATED) {
+        fprintf(stderr, "mysql data truncated\n");
+        exit(1);
+    }
+
+    fprintf(stderr, "results fetched successfully\n");
+}
+
+int main(int argc, char **argv) {
+    char* user = argv[1];
+    int   port = atoi(argv[2]);
+    char* db   = argv[3];
+
+    MYSQL *conn = mysql_init(NULL);
+    if (conn == NULL) {
+        fprintf(stderr, "%s\n", mysql_error(conn));
+        exit(1);
+    }
+
+    if (mysql_real_connect(conn, "127.0.0.1", user, "", db, port, NULL, 0) == NULL) {
+        fprintf(stderr, "%s\n", mysql_error(conn));
+        mysql_close(conn);
+        exit(1);
+    }
+
+    int pk = 1;
+    festate state = {
+        .query = "SELECT `i` from `tmp`.`t`",
+        .mysql_bind = {
+            [0] = {
+                .buffer_type = MYSQL_TYPE_LONG,
+                .buffer = (void *)(&pk),
+                .buffer_length = sizeof(pk),
+            }
+        },
+    };
+
+    BeginForeignScan(conn, &state);
+    IterateForeignScan(conn, &state);
+    if ( mysql_stmt_close(state.stmt) ) {
+        fprintf(stderr, "failed to close stmt: %s: %s\n", state.query, mysql_error(conn));
+        exit(1);
+    }
+    fprintf(stderr, "statement closed successfully\n");
+
+    mysql_close(conn);
+    return 0;
 }
