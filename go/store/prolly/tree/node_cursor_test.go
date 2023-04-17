@@ -15,15 +15,19 @@
 package tree
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math/rand"
+	"sort"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"unsafe"
 
 	"github.com/dolthub/dolt/go/store/prolly/message"
 	"github.com/dolthub/dolt/go/store/val"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNodeCursor(t *testing.T) {
@@ -175,4 +179,204 @@ func randomTupleItemPairs(count int, ns NodeStore) (items [][2]Item) {
 		items[i][1] = Item(tups[i][1])
 	}
 	return
+}
+
+func BenchmarkSortSearch(b *testing.B) {
+	const count = uint16(512)
+	const mod = count - 1
+	keys := randomKeys(count)
+	c4 := makeChunk(keys[:128])
+	c3 := makeChunk(keys[128:256])
+	c2 := makeChunk(keys[256:384])
+	c1 := makeChunk(keys[384:])
+	b.Run("linear search", func(b *testing.B) {
+		var x uint16
+		for i := 0; i < b.N; i++ {
+			k := keys[uint16(i)&mod]
+			x = linearSearch(k, c4)
+			x = linearSearch(k, c3)
+			x = linearSearch(k, c2)
+			x = linearSearch(k, c1)
+		}
+		assert.True(b, x < count)
+		b.ReportAllocs()
+	})
+	b.Run("sort search", func(b *testing.B) {
+		var x uint16
+		for i := 0; i < b.N; i++ {
+			k := keys[uint16(i)&mod]
+			x = sortSearch(k, c4)
+			x = sortSearch(k, c3)
+			x = sortSearch(k, c2)
+			x = sortSearch(k, c1)
+		}
+		assert.True(b, x < count)
+		b.ReportAllocs()
+	})
+	b.Run("branchless search", func(b *testing.B) {
+		var x uint16
+		for i := 0; i < b.N; i++ {
+			k := keys[uint16(i)&mod]
+			x = branchlessSearch(k, c4)
+			x = branchlessSearch(k, c3)
+			x = branchlessSearch(k, c2)
+			x = branchlessSearch(k, c1)
+		}
+		assert.True(b, x < count)
+		b.ReportAllocs()
+	})
+}
+
+func TestLinearSearch(t *testing.T) {
+	const n uint16 = 256
+	present := randomKeys(n)
+	absent := randomKeys(n)
+	ch := makeChunk(present)
+	for _, k := range present {
+		exp := sort.Search(int(n), func(i int) bool {
+			return bytes.Compare(k, ch.get(uint16(i))) < 0
+		})
+		act := linearSearch(k, ch)
+		assert.Equal(t, exp, int(act))
+	}
+	for _, k := range absent {
+		exp := sort.Search(int(n), func(i int) bool {
+			return bytes.Compare(k, ch.get(uint16(i))) < 0
+		})
+		act := linearSearch(k, ch)
+		assert.Equal(t, exp, int(act))
+	}
+}
+
+func linearSearch(k []byte, c chunk) (i uint16) {
+	for i = 0; i < c.count(); i++ {
+		if bytes.Compare(c.get(i), k) >= 0 {
+			break
+		}
+	}
+	return
+}
+
+func sortSearch(k []byte, c chunk) uint16 {
+	i, j := uint16(0), c.count()
+	for i < j {
+		h := (i + j) >> 1
+		cmp := bytes.Compare(k, c.get(h))
+		if cmp > 0 {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
+
+func branchlessSearch(k []byte, c chunk) uint16 {
+	lo, hi := uint16(0), c.count()
+	for hi > 1 {
+		mid := hi >> 1
+		cmp := bytes.Compare(c.get((lo+mid)-1), k)
+		lo += cmov(cmp, mid)
+		hi -= mid
+	}
+	return lo
+}
+
+func cmov(cmp int, mid uint16) uint16 {
+	return uint16(cmp>>1) & mid
+}
+
+func TestCmov(t *testing.T) {
+	assert.Equal(t, uint16(0), cmov(1, uint16(7)))
+	assert.Equal(t, uint16(0), cmov(0, uint16(7)))
+	assert.Equal(t, uint16(7), cmov(-1, uint16(7)))
+}
+
+func randomKeys(count uint16) (keys [][]byte) {
+	const maxKeySz = 32
+	keys = make([][]byte, count)
+	bb := make([]byte, count*maxKeySz)
+	rand.Read(bb)
+	for i := range keys {
+		sz := rand.Intn(24) + 8
+		keys[i] = bb[:sz]
+		bb = bb[sz:]
+	}
+	return
+}
+
+func TestMakeChunk(t *testing.T) {
+	data := make([]byte, 64)
+	keys := make([][]byte, 64)
+	for i := range keys {
+		data[i] = byte(i)
+		keys[i] = data[i : i+1]
+	}
+	c := makeChunk(keys)
+	for i := range keys {
+		assert.Equal(t, keys[i], c.get(uint16(i)))
+	}
+}
+
+type chunk struct {
+	buf []byte
+}
+
+func (c chunk) count() uint16 {
+	return readUint16(c.buf)
+}
+
+func (c chunk) get(i uint16) (v []byte) {
+	o := uint16Sz + uint16Sz*i
+	start := unsafeUint16(c.buf, o)
+	stop := unsafeUint16(c.buf, o+uint16Sz)
+	v = c.buf[start:stop]
+	return
+}
+
+const (
+	uint16Sz = 2
+)
+
+func makeChunk(keys [][]byte) (c chunk) {
+	sort.Slice(keys, func(i, j int) bool {
+		return bytes.Compare(keys[i], keys[j]) < 0
+	})
+	sz := uint16Sz + uint16Sz*(len(keys)+1)
+	off := uint16(sz) // key array offset
+	for _, k := range keys {
+		sz += len(k)
+	}
+	c.buf = make([]byte, sz)
+	bb := c.buf
+
+	// key count
+	writeUint16(bb, uint16(len(keys)))
+	bb = bb[uint16Sz:]
+	// key offsets
+	for _, k := range keys {
+		writeUint16(bb, off)
+		bb = bb[uint16Sz:]
+		off += uint16(len(k))
+	}
+	writeUint16(bb, off)
+	bb = bb[uint16Sz:]
+	for _, k := range keys {
+		n := copy(bb, k)
+		bb = bb[n:]
+	}
+	assertTrue(len(bb) == 0, "fuck")
+	return
+}
+
+func unsafeUint16(buf []byte, off uint16) uint16 {
+	return *(*uint16)(unsafe.Pointer(&buf[off]))
+}
+
+func readUint16(buf []byte) uint16 {
+	return binary.LittleEndian.Uint16(buf)
+}
+
+func writeUint16(buf []byte, v uint16) {
+	binary.LittleEndian.PutUint16(buf, v)
 }
