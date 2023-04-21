@@ -318,6 +318,25 @@ func TestMakeChunk(t *testing.T) {
 	}
 }
 
+func BenchmarkSplice(b *testing.B) {
+	const (
+		keys   = uint16(128)
+		writes = uint16(1024)
+		kmod   = keys - 1
+		wmod   = writes - 1
+	)
+
+	ch := makeChunk(randomKeys(keys))
+	wr := randomKeys(writes)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		j := uint16(i) & kmod
+		ch = ch.splice(j, wr[uint16(i)&wmod])
+	}
+	b.ReportAllocs()
+}
+
 type chunk struct {
 	buf []byte
 }
@@ -331,6 +350,27 @@ func (c chunk) get(i uint16) (v []byte) {
 	start := unsafeUint16(c.buf, o)
 	stop := unsafeUint16(c.buf, o+uint16Sz)
 	v = c.buf[start:stop]
+	return
+}
+
+func (c chunk) splice(i uint16, v []byte) (up chunk) {
+	o := uint16Sz + uint16Sz*i
+	start := readUint16(c.buf[o:])
+	stop := readUint16(c.buf[o+uint16Sz:])
+
+	diff := uint16(len(v)) - (stop - start)
+	up.buf = make([]byte, len(c.buf)+int(diff))
+
+	copy(up.buf, c.buf[:start])
+	copy(up.buf[int(start):], v)
+	copy(up.buf[int(start)+len(v):], c.buf[stop:])
+
+	// update offsets
+	for j := i + 1; j < c.count(); j++ {
+		bb := c.buf[uint16Sz+uint16Sz*j:]
+		off := readUint16(bb)
+		writeUint16(bb, off+diff)
+	}
 	return
 }
 
